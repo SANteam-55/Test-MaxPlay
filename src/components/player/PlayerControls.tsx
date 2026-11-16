@@ -1,0 +1,425 @@
+import React, { useState } from 'react';
+import {
+  Play,
+  Pause,
+  RotateCcw,
+  RotateCw,
+  ArrowLeft,
+  Maximize,
+  Minimize,
+  Maximize2,
+  Lock,
+  Unlock,
+  SkipForward,
+  Headphones,
+  PictureInPicture2,
+} from 'lucide-react';
+import { formatDuration } from '../../utils/helpers';
+import { ProgressBar } from './ProgressBar';
+
+interface PlayerControlsProps {
+  isVisible: boolean;
+  isPlaying: boolean;
+  currentTime: number;
+  duration: number;
+  title?: string;
+  isFullscreen?: boolean;
+  currentQuality?: string;
+  currentLanguage?: string;
+  playbackRate?: number;
+  isLocked?: boolean;
+  videoStretchMode?: 'contain' | 'fill' | 'cover';
+  onToggleStretchMode?: () => void;
+  videoElement?: HTMLVideoElement | null;
+  previewStreamUrl?: string;
+  posterUrl?: string;
+  timeOffset?: number;
+  onLockChange?: (locked: boolean) => void;
+  onLanguagePress?: () => void;
+  onPlayPause: () => void;
+  onSeek: (time: number) => void;
+  onRewind10: () => void;
+  onForward10: () => void;
+  onNext?: () => void;
+  onFullscreenToggle: () => void;
+  onPipToggle?: () => void;
+  onBack?: () => void;
+  onSettingsPress?: () => void;
+  onQualityPress?: () => void;
+  onSpeedPress?: () => void;
+  onScrubStart?: () => void;
+  onScrubEnd?: () => void;
+  skipMarkers?: {
+    intro?: { start: number; end: number };
+    outro?: { start: number; end: number };
+    credits?: { start: number; end: number };
+  };
+}
+
+export const PlayerControls: React.FC<PlayerControlsProps> = React.memo(({
+  isVisible,
+  isPlaying,
+  currentTime,
+  duration,
+  title,
+  isFullscreen = false,
+  currentQuality,
+  currentLanguage,
+  playbackRate = 1.0,
+  isLocked: externalIsLocked,
+  videoStretchMode = 'contain',
+  onToggleStretchMode,
+  videoElement,
+  previewStreamUrl,
+  posterUrl,
+  timeOffset = 0,
+  onLockChange,
+  onPlayPause,
+  onSeek,
+  onRewind10,
+  onForward10,
+  onNext,
+  onFullscreenToggle,
+  onPipToggle,
+  onBack,
+  onQualityPress,
+  onLanguagePress,
+  onSpeedPress,
+  onScrubStart,
+  onScrubEnd,
+  skipMarkers,
+}) => {
+  const [internalIsLocked, setInternalIsLocked] = useState(false);
+  const isLocked = externalIsLocked !== undefined ? externalIsLocked : internalIsLocked;
+
+  const [showUnlockBtn, setShowUnlockBtn] = useState(false);
+  const unlockTimerRef = React.useRef<NodeJS.Timeout | null>(null);
+
+  const triggerShowUnlock = () => {
+    setShowUnlockBtn(true);
+    if (unlockTimerRef.current) clearTimeout(unlockTimerRef.current);
+    unlockTimerRef.current = setTimeout(() => {
+      setShowUnlockBtn(false);
+    }, 1500);
+  };
+
+  const handleLock = () => {
+    if (onLockChange) {
+      onLockChange(true);
+    } else {
+      setInternalIsLocked(true);
+    }
+    triggerShowUnlock();
+  };
+
+  const handleUnlock = () => {
+    if (onLockChange) {
+      onLockChange(false);
+    } else {
+      setInternalIsLocked(false);
+    }
+    setShowUnlockBtn(false);
+    if (unlockTimerRef.current) clearTimeout(unlockTimerRef.current);
+  };
+
+  React.useEffect(() => {
+    return () => {
+      if (unlockTimerRef.current) clearTimeout(unlockTimerRef.current);
+    };
+  }, []);
+
+  // When player is locked, render the lock/unlock overlay
+  if (isLocked) {
+    return (
+      <div
+        onClick={triggerShowUnlock}
+        className="absolute inset-0 z-40 flex items-center pointer-events-auto select-none bg-black/1"
+      >
+        {showUnlockBtn && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              handleUnlock();
+            }}
+            className="absolute left-3 sm:left-6 md:left-8 top-1/2 -translate-y-1/2 z-50 flex h-11 w-11 sm:h-12 sm:w-12 items-center justify-center bg-transparent text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)] transition-all hover:scale-110 active:scale-90 cursor-pointer animate-in fade-in zoom-in-90 duration-150"
+            title="Locked - Tap to Unlock"
+          >
+            <Lock className="h-6 w-6 text-white animate-pulse drop-shadow-[0_2px_8px_rgba(0,0,0,0.95)]" />
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  if (!isVisible) return null;
+
+  const stretchLabel =
+    videoStretchMode === 'fill'
+      ? 'STRETCH'
+      : videoStretchMode === 'cover'
+      ? 'ZOOM'
+      : 'FIT';
+
+  return (
+    <div 
+      className="absolute inset-0 z-20 flex flex-col justify-between bg-black/45 p-3 sm:p-4 transition-opacity duration-300 select-none pointer-events-none"
+    >
+      {/* Top Bar (Back Button + Video Title only — unused top-right icons removed) */}
+      <div className="flex items-center justify-between gap-3 w-full pointer-events-auto">
+        <div className={`flex items-center gap-2.5 min-w-0 flex-1 ${!onBack ? 'pl-12' : ''}`}>
+          {onBack && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onBack();
+              }}
+              onMouseDown={(e) => {
+                e.stopPropagation();
+              }}
+              onTouchStart={(e) => {
+                e.stopPropagation();
+              }}
+              onTouchEnd={(e) => {
+                e.stopPropagation();
+              }}
+              className="flex h-9 w-9 sm:h-10 sm:w-10 items-center justify-center rounded-full bg-black/80 hover:bg-black text-white border border-white/35 hover:border-white/70 shadow-2xl cursor-pointer shrink-0 transition-all hover:scale-105 active:scale-90 pointer-events-auto"
+              title="Go Back / Exit"
+              aria-label="Exit player"
+            >
+              <ArrowLeft className="h-5 w-5 sm:h-6 sm:w-6 stroke-[2.5]" />
+            </button>
+          )}
+          {title && (
+            <span
+              className="truncate text-xs sm:text-sm font-semibold text-white drop-shadow ml-1"
+              title={title}
+            >
+              {title}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Lock Button (Inactive Lock state: Open Lock icon on left — no black circle background) */}
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          handleLock();
+        }}
+        className="absolute left-3 sm:left-6 md:left-8 top-1/2 -translate-y-1/2 z-30 flex h-10 w-10 sm:h-11 sm:w-11 items-center justify-center bg-transparent text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)] transition-all hover:scale-110 active:scale-90 cursor-pointer pointer-events-auto"
+        title="Lock Controls"
+      >
+        <Unlock className="h-5 w-5 sm:h-6 sm:w-6 text-white drop-shadow-[0_2px_8px_rgba(0,0,0,0.95)]" />
+      </button>
+
+      {/* CENTER CONTROLS TRIPLET: Rewind 10s, Play/Pause, Forward 10s (Clean icons without black circular backgrounds) */}
+      <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-30 flex items-center justify-center gap-7 sm:gap-11 md:gap-14 select-none pointer-events-auto">
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onRewind10();
+          }}
+          className="relative flex h-11 w-11 sm:h-12 sm:w-12 items-center justify-center bg-transparent text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)] transition-all hover:scale-110 active:scale-90 cursor-pointer"
+          title="Rewind 10s"
+        >
+          <RotateCcw className="h-6 w-6 sm:h-7 sm:w-7 drop-shadow-[0_2px_8px_rgba(0,0,0,0.95)]" />
+          <span className="absolute inset-0 flex items-center justify-center text-[9.5px] font-extrabold drop-shadow-[0_1px_4px_rgba(0,0,0,0.95)]">10</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onPlayPause();
+          }}
+          className="flex h-15 w-15 sm:h-16 sm:w-16 items-center justify-center bg-transparent text-white drop-shadow-[0_2px_12px_rgba(0,0,0,0.95)] transition-transform duration-150 hover:scale-110 active:scale-90 cursor-pointer"
+          title={isPlaying ? 'Pause' : 'Play'}
+        >
+          {isPlaying ? (
+            <Pause className="h-8 w-8 sm:h-9 sm:w-9 fill-current drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)]" />
+          ) : (
+            <Play className="h-8 w-8 sm:h-9 sm:w-9 fill-current ml-0.5 drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)]" />
+          )}
+        </button>
+
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onForward10();
+          }}
+          className="relative flex h-11 w-11 sm:h-12 sm:w-12 items-center justify-center bg-transparent text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)] transition-all hover:scale-110 active:scale-90 cursor-pointer"
+          title="Forward 10s"
+        >
+          <RotateCw className="h-6 w-6 sm:h-7 sm:w-7 drop-shadow-[0_2px_8px_rgba(0,0,0,0.95)]" />
+          <span className="absolute inset-0 flex items-center justify-center text-[9.5px] font-extrabold drop-shadow-[0_1px_4px_rgba(0,0,0,0.95)]">10</span>
+        </button>
+      </div>
+
+      {/* Bottom Bar */}
+      <div className="flex flex-col gap-1 pointer-events-auto w-full">
+        {/* Progress bar */}
+        <div className="relative flex items-center">
+          <ProgressBar
+            currentTime={currentTime}
+            duration={duration}
+            onSeek={onSeek}
+            onScrubStart={onScrubStart}
+            onScrubEnd={onScrubEnd}
+            videoElement={videoElement}
+            previewStreamUrl={previewStreamUrl}
+            posterUrl={posterUrl}
+            timeOffset={timeOffset}
+            skipMarkers={skipMarkers}
+          />
+        </div>
+
+        <div className="flex items-center justify-between gap-1 text-[10px] sm:text-[11px] text-white/90 mt-1 w-full min-w-0">
+          <div className="flex items-center gap-1 sm:gap-1.5 min-w-0 shrink">
+            <span className="tabular-nums font-medium shrink-0">{formatDuration(currentTime)}</span>
+            <span className="text-white/40 shrink-0">/</span>
+            <span className="tabular-nums text-white/70 shrink-0">{duration > 0 ? formatDuration(duration) : '--:--'}</span>
+
+            {/* FULLSCREEN ONLY: 1X Speed + Next (Series mode) + Stretch Fullscreen Toggle */}
+            {isFullscreen && (
+              <>
+                {onSpeedPress && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSpeedPress();
+                    }}
+                    className="flex items-center justify-center h-[22px] sm:h-[26px] px-2 ml-1 rounded-md bg-white/10 hover:bg-[#8B5CF6]/30 border border-white/20 text-white hover:text-[#C4B5FD] transition cursor-pointer active:scale-95 select-none min-w-[32px] sm:min-w-[36px] shrink-0"
+                    title="Change Playback Speed"
+                  >
+                    <span className="text-[9px] sm:text-[10px] font-extrabold uppercase tracking-wider text-white leading-none">
+                      {playbackRate === 1.0 ? '1X' : `${playbackRate}X`}
+                    </span>
+                  </button>
+                )}
+
+                {/* Next Episode Button right next to 1X Speed Drawer in Series Mode */}
+                {onNext && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onNext();
+                    }}
+                    className="flex items-center gap-1 h-[22px] sm:h-[26px] px-2 rounded-md bg-[#8B5CF6]/25 hover:bg-[#8B5CF6]/45 border border-[#8B5CF6]/50 text-white transition cursor-pointer active:scale-95 select-none shrink-0"
+                    title="Next Episode"
+                  >
+                    <SkipForward className="h-3 w-3 sm:h-3.5 sm:w-3.5 text-[#C4B5FD] shrink-0" />
+                    <span className="text-[9px] sm:text-[10px] font-extrabold uppercase tracking-wider text-white leading-none">
+                      Next
+                    </span>
+                  </button>
+                )}
+
+                {/* Fullscreen Video Stretch Button (next to Next in Series mode, or next to 1X in Movie mode) */}
+                {onToggleStretchMode && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onToggleStretchMode();
+                    }}
+                    className={`flex items-center gap-1 h-[22px] sm:h-[26px] px-2 rounded-md border transition cursor-pointer active:scale-95 select-none shrink-0 ${
+                      videoStretchMode !== 'contain'
+                        ? 'bg-[#8B5CF6]/35 border-[#8B5CF6]/70 text-white'
+                        : 'bg-white/10 hover:bg-[#8B5CF6]/30 border-white/20 text-white hover:text-[#C4B5FD]'
+                    }`}
+                    title="Stretch / Fit Video to Fullscreen"
+                  >
+                    <Maximize2 className="h-3 w-3 sm:h-3.5 sm:w-3.5 text-amber-300 shrink-0" />
+                    <span className="text-[9px] sm:text-[10px] font-extrabold uppercase tracking-wider text-white leading-none">
+                      {stretchLabel}
+                    </span>
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+            {/* FULLSCREEN ONLY: Audio Language & Quality Selectors */}
+            {isFullscreen && (
+              <>
+                {onLanguagePress && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onLanguagePress();
+                    }}
+                    className="flex items-center gap-1 h-[22px] sm:h-[26px] px-1.5 sm:px-2 rounded-md bg-white/10 hover:bg-[#8B5CF6]/30 border border-white/20 text-white hover:text-[#C4B5FD] transition cursor-pointer active:scale-95 select-none max-w-[84px] sm:max-w-none shrink-0"
+                    title="Audio Language"
+                  >
+                    <Headphones className="h-3 w-3 sm:h-3.5 sm:w-3.5 text-[#38BDF8] shrink-0" />
+                    <span className="text-[9px] sm:text-[10px] font-extrabold uppercase tracking-wider text-white leading-none truncate">
+                      {currentLanguage ? currentLanguage.toUpperCase() : 'AUDIO'}
+                    </span>
+                  </button>
+                )}
+
+                {onQualityPress && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onQualityPress();
+                    }}
+                    className="flex items-center justify-center h-[22px] sm:h-[26px] px-1.5 sm:px-2 rounded-md bg-white/10 hover:bg-[#8B5CF6]/30 border border-white/20 text-white hover:text-[#C4B5FD] transition cursor-pointer active:scale-95 select-none min-w-[38px] sm:min-w-[48px] shrink-0"
+                    title="Switch Quality"
+                  >
+                    <span className="text-[9px] sm:text-[10px] font-extrabold uppercase tracking-wider text-white leading-none">
+                      {currentQuality ? currentQuality.toUpperCase() : 'AUTO'}
+                    </span>
+                  </button>
+                )}
+              </>
+            )}
+
+            {/* Picture in Picture Button (Visible in both Vertical & Fullscreen) */}
+            {onPipToggle && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onPipToggle();
+                }}
+                className="p-1 text-white/85 hover:text-white transition cursor-pointer flex items-center justify-center shrink-0"
+                title="Picture in Picture"
+              >
+                <PictureInPicture2 className="h-4 w-4" />
+              </button>
+            )}
+
+            {/* Fullscreen Button (Visible in both Vertical & Fullscreen) */}
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onFullscreenToggle();
+              }}
+              className="p-1 text-white/95 hover:text-white transition cursor-pointer flex items-center justify-center shrink-0"
+              title="Fullscreen"
+            >
+              {isFullscreen ? (
+                <Minimize className="h-4 w-4" />
+              ) : (
+                <Maximize className="h-4 w-4" />
+              )}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+});

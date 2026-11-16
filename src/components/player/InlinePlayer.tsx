@@ -1,0 +1,2811 @@
+import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import Hls from 'hls.js';
+import { 
+  Loader2, 
+  AlertTriangle, 
+  Play, 
+  SkipForward, 
+  FastForward,
+  Sun,
+  SunMedium,
+  Volume2,
+  Volume1,
+  VolumeX,
+  Zap,
+  ArrowLeft
+} from 'lucide-react';
+import { PlayerControls } from './PlayerControls';
+import { GestureHandler } from './GestureHandler';
+import { SpeedDrawer } from './SpeedDrawer';
+import { QualityDrawer } from './QualityDrawer';
+import { AudioLangDrawer } from './AudioLangDrawer';
+import { SpeedCapsuleHUD } from './SpeedCapsuleHUD';
+import { adManager } from '../../services/adService';
+import { useAuth } from '../../context/AuthContext';
+import { SmartStreamService } from '../../services/smartStreamService';
+import { NativeBridgeService } from '../../services/nativeBridgeService';
+import { ClientHlsDownloader } from '../../services/clientHlsDownloader';
+
+const isQualityLabelKey = (val?: string): boolean => {
+  if (!val || typeof val !== 'string') return false;
+  return /^(\d{3,4}p|4k|2k|8k|hd|fhd|uhd|sd|auto)$/i.test(val.trim());
+};
+
+const findMatchingHlsLevelIndex = (levels: any[], qualStr?: string): number => {
+  if (!levels || levels.length === 0 || !qualStr || qualStr.toLowerCase() === 'auto') return -1;
+  const cleanQ = qualStr.toLowerCase().trim();
+  const targetHeight = parseInt(cleanQ.replace(/\D/g, ''), 10);
+
+  // 1. Exact classified label match (handles cinematic widescreen 1920x800 = 1080p, 1280x534 = 720p, 854x356 = 480p, 640x268 = 360p)
+  const classifiedIdx = levels.findIndex((lvl: any) => {
+    const label = ClientHlsDownloader.classifyResolutionLabel(
+      lvl.width || 0,
+      lvl.height || 0,
+      lvl.bitrate || 0
+    ).toLowerCase();
+    return label === cleanQ;
+  });
+  if (classifiedIdx !== -1) return classifiedIdx;
+
+  // 2. Exact height match
+  if (!isNaN(targetHeight) && targetHeight > 0) {
+    const exactHeightIdx = levels.findIndex((lvl: any) => lvl.height === targetHeight);
+    if (exactHeightIdx !== -1) return exactHeightIdx;
+
+    // 3. Closest nominal height match
+    let bestIdx = 0;
+    let bestDiff = Infinity;
+    levels.forEach((lvl: any, idx: number) => {
+      const label = ClientHlsDownloader.classifyResolutionLabel(
+        lvl.width || 0,
+        lvl.height || 0,
+        lvl.bitrate || 0
+      );
+      const nomH = parseInt(label.replace(/\D/g, ''), 10) || lvl.height || 720;
+      const diff = Math.abs(nomH - targetHeight);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestIdx = idx;
+      }
+    });
+    return bestIdx;
+  }
+  return -1;
+};
+
+// Comprehensive ISO 639 & friendly language label mapper
+export const formatLanguageLabel = (name?: string, lang?: string, index?: number): string => {
+  const code = (lang || '').toLowerCase().trim();
+  const rawName = (name || '').trim();
+
+  const ISO_MAP: Record<string, string> = {
+    hin: 'Hindi',
+    hi: 'Hindi',
+    eng: 'English',
+    en: 'English',
+    jpn: 'Japanese',
+    ja: 'Japanese',
+    tam: 'Tamil',
+    ta: 'Tamil',
+    tel: 'Telugu',
+    te: 'Telugu',
+    mal: 'Malayalam',
+    ml: 'Malayalam',
+    kan: 'Kannada',
+    kn: 'Kannada',
+    kor: 'Korean',
+    ko: 'Korean',
+    spa: 'Spanish',
+    es: 'Spanish',
+    fra: 'French',
+    fr: 'French',
+    deu: 'German',
+    de: 'German',
+    ita: 'Italian',
+    it: 'Italian',
+    rus: 'Russian',
+    ru: 'Russian',
+    por: 'Portuguese',
+    pt: 'Portuguese',
+    ara: 'Arabic',
+    ar: 'Arabic',
+    zho: 'Chinese',
+    zh: 'Chinese',
+  };
+
+  if (ISO_MAP[code]) return ISO_MAP[code];
+
+  if (rawName) {
+    const lower = rawName.toLowerCase();
+    for (const [key, val] of Object.entries(ISO_MAP)) {
+      if (lower === key || lower.includes(val.toLowerCase()) || lower.includes(key)) {
+        return val;
+      }
+    }
+    return rawName;
+  }
+
+  return code.toUpperCase() || `Audio Track ${(index ?? 0) + 1}`;
+};
+
+interface InlinePlayerProps {
+  videoUrl?: string;
+  qualityLinks?: Record<string, string>;
+  videoSources?: Record<string, any>;
+  availableLanguages?: string[];
+  chunks?: any[];
+  posterUrl?: string;
+  title?: string;
+  streamKey?: string;
+  initialTime?: number;
+  autoPlay?: boolean;
+  activeLanguage?: string;
+  activeQuality?: string;
+  onLanguageChange?: (lang: string) => void;
+  onQualityChange?: (qual: string) => void;
+  onProgress?: (time: number, isFinished?: boolean, totalDuration?: number) => void;
+  onPause?: (time: number, totalDuration?: number) => void;
+  onDuration?: (duration: number) => void;
+  onComplete?: () => void;
+  onNext?: () => void;
+  onBack?: () => void;
+  timeOffset?: number;
+  globalDuration?: number;
+  onGlobalSeek?: (targetTime: number) => void;
+  skipMarkers?: any;
+  isSmartHls?: boolean;
+  selectedServer?: 'server1' | 'server2' | 'server3';
+  crossServerQualities?: string[];
+  onDiscoveredAudioTracks?: (tracks: string[]) => void;
+  onDiscoveredQualities?: (qualities: string[]) => void;
+  onRequestCrossServerLanguageSwitch?: (lang: string) => void;
+  onRequestServerFailover?: (failedServer: 'server1' | 'server2' | 'server3') => boolean;
+}
+
+export const InlinePlayer: React.FC<InlinePlayerProps> = ({
+  videoUrl,
+  qualityLinks,
+  videoSources,
+  availableLanguages: propAvailableLanguages,
+  posterUrl,
+  title,
+  streamKey,
+  initialTime = 0,
+  autoPlay = false,
+  activeLanguage,
+  activeQuality = 'auto',
+  onLanguageChange,
+  onQualityChange,
+  onProgress,
+  onPause,
+  onDuration,
+  onComplete,
+  onNext,
+  onBack,
+  timeOffset = 0,
+  globalDuration,
+  onGlobalSeek,
+  skipMarkers,
+  isSmartHls,
+  selectedServer = 'server1',
+  crossServerQualities = [],
+  onDiscoveredAudioTracks,
+  onDiscoveredQualities,
+  onRequestCrossServerLanguageSwitch,
+  onRequestServerFailover,
+}) => {
+  const { user } = useAuth();
+  const playerContainerRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const hlsRef = useRef<Hls | null>(null);
+  const prevStreamKeyRef = useRef<string | undefined>(streamKey);
+  const prevServerRef = useRef<'server1' | 'server2' | 'server3'>(selectedServer);
+  
+  // Gesture and volume states (synced with real Android hardware inside APK)
+  const [brightness, setBrightness] = useState<number>(() => {
+    const nativeB = NativeBridgeService.getNativeBrightness();
+    return nativeB !== null && nativeB > 0 ? nativeB : 100;
+  });
+  const [volume, setVolume] = useState<number>(() => {
+    const nativeV = NativeBridgeService.getNativeVolume();
+    return nativeV !== null && nativeV >= 0 ? nativeV : 100;
+  });
+  const [showBrightnessIndicator, setShowBrightnessIndicator] = useState(false);
+  const [showVolumeIndicator, setShowVolumeIndicator] = useState(false);
+  const indicatorTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const [isFastForwarding, setIsFastForwarding] = useState(false);
+  const [capsuleSpeed, setCapsuleSpeed] = useState<number>(2.0);
+  const [capsuleProgress, setCapsuleProgress] = useState<number>(66.66);
+  const prevSpeedRef = useRef<number>(1);
+
+  // Basic states
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [hasStarted, setHasStarted] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [showControls, setShowControls] = useState(true);
+  const [isLocked, setIsLocked] = useState(false);
+  const [currentTime, setCurrentTime] = useState(initialTime);
+  const [duration, setDuration] = useState(0);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [videoStretchMode, setVideoStretchMode] = useState<'contain' | 'fill' | 'cover'>('contain');
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
+
+  // Advanced features states
+  const [playbackRate, setPlaybackRate] = useState<number>(1);
+  const [currentLanguage, setCurrentLanguage] = useState<string>(activeLanguage || '');
+  const [currentQuality, setCurrentQuality] = useState<string>(activeQuality || 'auto');
+
+  // Smart Stream & Dynamic HLS states
+  const [resolvedStreamUrl, setResolvedStreamUrl] = useState<string>('');
+  const [isResolvingStream, setIsResolvingStream] = useState<boolean>(false);
+  const [hlsQualities, setHlsQualities] = useState<string[]>([]);
+  const [hlsAudioTracks, setHlsAudioTracks] = useState<{ id: number; name: string; lang: string }[]>([]);
+  const [actualQuality, setActualQuality] = useState<string>('');
+  const isHlsStreamRef = useRef<boolean>(false);
+  const streamRetryAttemptedRef = useRef<boolean>(false);
+  
+  // Menu drawers state
+  const [activeMenu, setActiveMenu] = useState<'language' | 'quality' | 'speed' | null>(null);
+  const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const lastProgressEmitRef = useRef<number>(0);
+  const lastTimeStateUpdateRef = useRef<number>(0);
+  const recoverDecodingErrorDateRef = useRef<number>(0);
+
+  // Normalize skipMarkers from any structure or format (numbers, strings, mm:ss)
+  const normalizedSkipMarkers = useMemo(() => {
+    let parsedMarkers = skipMarkers;
+    
+    if (typeof parsedMarkers === 'string') {
+      try {
+        parsedMarkers = JSON.parse(parsedMarkers);
+      } catch (e) {
+        console.warn('Failed to parse skipMarkers string:', e);
+        return undefined;
+      }
+    }
+
+    if (!parsedMarkers || typeof parsedMarkers !== 'object') return undefined;
+
+    const parseSec = (val: any) => {
+      if (typeof val === 'number') return isNaN(val) ? 0 : val;
+      if (typeof val === 'string') {
+        if (val.includes(':')) {
+          const parts = val.split(':').map(p => Number(p.trim()));
+          if (parts.some(isNaN)) return 0;
+          if (parts.length === 2) return (parts[0] * 60) + parts[1];
+          if (parts.length === 3) return (parts[0] * 3600) + (parts[1] * 60) + parts[2];
+        }
+        const n = Number(val.trim());
+        return isNaN(n) ? 0 : n;
+      }
+      return 0;
+    };
+
+    const res: { intro?: { start: number; end: number }; outro?: { start: number; end: number }; credits?: { start: number; end: number } } = {};
+
+    if (Array.isArray(parsedMarkers)) {
+      parsedMarkers.forEach((m: any) => {
+        if (!m || !m.type) return;
+        const s = parseSec(m.start ?? m.startTime);
+        const e = parseSec(m.end ?? m.endTime);
+        if (e > s && e > 0) {
+          const t = m.type.toLowerCase();
+          if (t.includes('intro')) res.intro = { start: s, end: e };
+          if (t.includes('outro')) res.outro = { start: s, end: e };
+          if (t.includes('credit')) res.credits = { start: s, end: e };
+        }
+      });
+    } else {
+      const introStart = parseSec(parsedMarkers.intro?.start ?? (parsedMarkers as any).introStart ?? (parsedMarkers as any).intro_start);
+      const introEnd = parseSec(parsedMarkers.intro?.end ?? (parsedMarkers as any).introEnd ?? (parsedMarkers as any).intro_end);
+      const outroStart = parseSec(parsedMarkers.outro?.start ?? (parsedMarkers as any).outroStart ?? (parsedMarkers as any).outro_start);
+      const outroEnd = parseSec(parsedMarkers.outro?.end ?? (parsedMarkers as any).outroEnd ?? (parsedMarkers as any).outro_end);
+      const creditsStart = parseSec(parsedMarkers.credits?.start ?? (parsedMarkers as any).creditsStart ?? (parsedMarkers as any).credits_start);
+      const creditsEnd = parseSec(parsedMarkers.credits?.end ?? (parsedMarkers as any).creditsEnd ?? (parsedMarkers as any).credits_end);
+
+      if (introEnd > introStart && introEnd > 0) res.intro = { start: introStart, end: introEnd };
+      if (outroEnd > outroStart && outroEnd > 0) res.outro = { start: outroStart, end: outroEnd };
+      if (creditsEnd > creditsStart && creditsEnd > 0) res.credits = { start: creditsStart, end: creditsEnd };
+    }
+
+    return Object.keys(res).length > 0 ? res : undefined;
+  }, [skipMarkers]);
+
+  // Active Skip Marker based on current global playback time
+  const activeSkipMarker = useMemo(() => {
+    if (!normalizedSkipMarkers) return null;
+    const currentGlobal = timeOffset + currentTime;
+    const { intro, outro, credits } = normalizedSkipMarkers;
+    
+    console.log('[SkipDebug] Current Global Time:', currentGlobal, 'Markers:', normalizedSkipMarkers);
+
+    if (intro && currentGlobal >= intro.start && currentGlobal < intro.end) {
+      return { type: 'intro', label: 'Skip Intro', end: intro.end };
+    }
+    if (outro && currentGlobal >= outro.start && currentGlobal < outro.end) {
+      return { type: 'outro', label: 'Skip Outro', end: outro.end };
+    }
+    if (credits && currentGlobal >= credits.start && currentGlobal < credits.end) {
+      return { type: 'credits', label: 'Skip Credits', end: credits.end };
+    }
+    return null;
+  }, [normalizedSkipMarkers, timeOffset, currentTime]);
+
+  // Crunchyroll / Netflix style 5-second auto-popup on entering Intro / Outro marker
+  const [autoShowSkip, setAutoShowSkip] = useState(false);
+  const autoHideSkipTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const lastActiveMarkerKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!activeSkipMarker || isLocked) {
+      if (lastActiveMarkerKeyRef.current !== null) {
+        lastActiveMarkerKeyRef.current = null;
+        setAutoShowSkip(false);
+        if (autoHideSkipTimeoutRef.current) {
+          clearTimeout(autoHideSkipTimeoutRef.current);
+          autoHideSkipTimeoutRef.current = null;
+        }
+      }
+      return;
+    }
+
+    const markerKey = `${activeSkipMarker.type}_${activeSkipMarker.end}`;
+    if (lastActiveMarkerKeyRef.current !== markerKey) {
+      lastActiveMarkerKeyRef.current = markerKey;
+      setAutoShowSkip(true);
+
+      if (autoHideSkipTimeoutRef.current) {
+        clearTimeout(autoHideSkipTimeoutRef.current);
+      }
+      // Stay visible for 5 seconds automatically, then gracefully hide if user didn't open controls
+      autoHideSkipTimeoutRef.current = setTimeout(() => {
+        setAutoShowSkip(false);
+      }, 5000);
+    }
+  }, [activeSkipMarker, isLocked]);
+
+  useEffect(() => {
+    return () => {
+      if (autoHideSkipTimeoutRef.current) {
+        clearTimeout(autoHideSkipTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  const resetControlsTimeout = useCallback(() => {
+    if (controlsTimeoutRef.current) {
+      clearTimeout(controlsTimeoutRef.current);
+      controlsTimeoutRef.current = null;
+    }
+    if (isPlaying && !activeMenu && !isLocked) {
+      controlsTimeoutRef.current = setTimeout(() => {
+        setShowControls(false);
+      }, 4000);
+    }
+  }, [isPlaying, activeMenu, isLocked]);
+
+  // Handle gestures
+  const showIndicator = (type: 'brightness' | 'volume') => {
+    if (type === 'brightness') {
+      setShowBrightnessIndicator(true);
+      setShowVolumeIndicator(false);
+    } else {
+      setShowVolumeIndicator(true);
+      setShowBrightnessIndicator(false);
+    }
+    
+    if (indicatorTimeoutRef.current) clearTimeout(indicatorTimeoutRef.current);
+    indicatorTimeoutRef.current = setTimeout(() => {
+      setShowBrightnessIndicator(false);
+      setShowVolumeIndicator(false);
+    }, 1500);
+  };
+
+  const handleBrightnessChange = useCallback((delta: number) => {
+    setBrightness((prev) => {
+      const newVal = Math.round(Math.max(10, Math.min(200, prev + delta)));
+      // Control real Android phone screen brightness inside APK (0-100%)
+      if (NativeBridgeService.isRunningInKotlinApp()) {
+        NativeBridgeService.setNativeBrightness(Math.min(100, Math.max(5, newVal)));
+      }
+      return newVal;
+    });
+    showIndicator('brightness');
+  }, []);
+
+  const handleVolumeChange = useCallback((delta: number) => {
+    setVolume((prev) => {
+      const newVal = Math.round(Math.max(0, Math.min(200, prev + delta)));
+      // Control real Android phone hardware media volume inside APK (0-100%)
+      if (NativeBridgeService.isRunningInKotlinApp()) {
+        // Map 0-200% UI slider smoothly so 0->0, 100-200%->max hardware volume without muting
+        const hwVol = newVal <= 100 ? newVal : 100;
+        NativeBridgeService.setNativeVolume(Math.min(100, Math.max(0, hwVol)));
+      }
+      return newVal;
+    });
+    showIndicator('volume');
+  }, []);
+
+  const [hasRenderedFirstFrame, setHasRenderedFirstFrame] = useState(false);
+
+  // Reset first-frame flag only when switching to a brand new content title (not during mid-stream quality switch)
+  useEffect(() => {
+    if (!isSwitchingSourceRef.current) {
+      setHasRenderedFirstFrame(false);
+    }
+  }, [title, posterUrl]);
+
+  // Apply volume changes directly to native HTML5 video element without WebAudio CORS-tainting
+  // (Calling createMediaElementSource on cross-origin or maxplay.local offline/device videos causes Chromium WebView to permanently mute audio at >100%)
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (volume <= 0) {
+      video.volume = 0;
+      video.muted = true;
+    } else {
+      video.muted = false;
+      // Keep HTML5 video volume at 1.0 when volume >= 100% (up to 200%) so audio never cuts out
+      video.volume = NativeBridgeService.isRunningInKotlinApp()
+        ? 1
+        : Math.min(1, Math.max(0.05, volume / 100));
+    }
+  }, [volume]);
+
+  const [isCapsuleMinimized, setIsCapsuleMinimized] = useState(false);
+  const capsuleMinimizeTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const lastDiscreteSpeedRef = useRef<number>(2.0);
+
+  const scheduleCapsuleMinimize = useCallback(() => {
+    if (capsuleMinimizeTimerRef.current) {
+      clearTimeout(capsuleMinimizeTimerRef.current);
+    }
+    capsuleMinimizeTimerRef.current = setTimeout(() => {
+      setIsCapsuleMinimized(true);
+    }, 550);
+  }, []);
+
+  const handleLongPressStart = useCallback(() => {
+    if (videoRef.current && !isFastForwarding) {
+      prevSpeedRef.current = videoRef.current.playbackRate || 1;
+      videoRef.current.playbackRate = 2.0;
+      setPlaybackRate(2.0);
+      setCapsuleSpeed(2.0);
+      setCapsuleProgress(66.66);
+      lastDiscreteSpeedRef.current = 2.0;
+      setIsCapsuleMinimized(false);
+      setIsFastForwarding(true);
+      scheduleCapsuleMinimize();
+    }
+  }, [isFastForwarding, scheduleCapsuleMinimize]);
+
+  const handleLongPressMove = useCallback((deltaX: number) => {
+    // Anchor is index 2 (2.0x Fast) in discrete points [0.5, 1.0, 2.0, 3.0]
+    // Sliding left/right snaps strictly to one of the 4 discrete points (every ~42px)
+    const discretePoints = [0.5, 1.0, 2.0, 3.0];
+    const stepOffset = Math.round(deltaX / 42);
+    const snappedIdx = Math.max(0, Math.min(discretePoints.length - 1, 2 + stepOffset));
+    const finalSpeed = discretePoints[snappedIdx];
+    const snappedProgress = (snappedIdx / (discretePoints.length - 1)) * 100;
+
+    if (finalSpeed !== lastDiscreteSpeedRef.current) {
+      lastDiscreteSpeedRef.current = finalSpeed;
+      setIsCapsuleMinimized(false);
+      scheduleCapsuleMinimize();
+    }
+
+    setCapsuleProgress(snappedProgress);
+    setCapsuleSpeed(finalSpeed);
+
+    if (videoRef.current) {
+      videoRef.current.playbackRate = finalSpeed;
+    }
+    setPlaybackRate(finalSpeed);
+  }, [scheduleCapsuleMinimize]);
+
+  const handleLongPressEnd = useCallback(() => {
+    if (capsuleMinimizeTimerRef.current) {
+      clearTimeout(capsuleMinimizeTimerRef.current);
+      capsuleMinimizeTimerRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.playbackRate = 1.0;
+    }
+    setPlaybackRate(1.0);
+    setIsFastForwarding(false);
+    setIsCapsuleMinimized(false);
+    setCapsuleSpeed(2.0);
+    setCapsuleProgress(66.66);
+    lastDiscreteSpeedRef.current = 2.0;
+  }, []);
+
+  // Keep controls timer in sync with playback state and menus
+  useEffect(() => {
+    if (showControls && isPlaying && !activeMenu && !isLocked) {
+      resetControlsTimeout();
+    } else if (!isPlaying || activeMenu || isLocked) {
+      if (controlsTimeoutRef.current) {
+        clearTimeout(controlsTimeoutRef.current);
+        controlsTimeoutRef.current = null;
+      }
+    }
+    return () => {
+      if (controlsTimeoutRef.current) {
+        clearTimeout(controlsTimeoutRef.current);
+        controlsTimeoutRef.current = null;
+      }
+    };
+  }, [showControls, isPlaying, activeMenu, isLocked, resetControlsTimeout]);
+
+  // Prevent default browser context menu (Back, Forward, Reload, Print, Share, etc.) during player interactions
+  useEffect(() => {
+    const handlePreventContextMenu = (e: Event) => {
+      e.preventDefault();
+      e.stopPropagation();
+    };
+
+    const container = playerContainerRef.current;
+    if (container) {
+      container.addEventListener('contextmenu', handlePreventContextMenu, { passive: false });
+    }
+
+    return () => {
+      if (container) {
+        container.removeEventListener('contextmenu', handlePreventContextMenu);
+      }
+    };
+  }, []);
+
+  const handleControlInteraction = useCallback(() => {
+    if (showControls && !isLocked) {
+      resetControlsTimeout();
+    }
+  }, [showControls, isLocked, resetControlsTimeout]);
+
+  const toggleControls = useCallback(() => {
+    if (isLocked) {
+      return;
+    }
+    if (activeMenu) {
+      setActiveMenu(null);
+      return;
+    }
+    setShowControls((prev) => {
+      const next = !prev;
+      if (next && videoRef.current) {
+        setCurrentTime(videoRef.current.currentTime);
+      }
+      return next;
+    });
+  }, [activeMenu, isLocked]);
+
+  // Derive available languages for current videoSources, dynamic HLS audio tracks, or passed content languages
+  const availableLanguages = useMemo(() => {
+    const list: string[] = [];
+    const addLang = (raw?: string) => {
+      if (!raw || typeof raw !== 'string') return;
+      const clean = raw.trim();
+      if (
+        !clean ||
+        clean.toLowerCase() === 'default' ||
+        clean.toLowerCase() === 'default audio' ||
+        isQualityLabelKey(clean)
+      ) {
+        return;
+      }
+      const normalized = ClientHlsDownloader.normalizeLanguageLabel(clean, clean) || clean;
+      if (!normalized || isQualityLabelKey(normalized)) return;
+      if (!list.some((existing) => existing.toLowerCase() === normalized.toLowerCase())) {
+        list.push(normalized);
+      }
+    };
+
+    // 1. Dynamic HLS audio tracks from master playlist
+    if (hlsAudioTracks.length > 0) {
+      hlsAudioTracks.forEach((t) => addLang(t.name));
+    }
+
+    // 2. Multi-language videoSources (only valid language keys, never quality keys)
+    if (videoSources && typeof videoSources === 'object') {
+      Object.keys(videoSources).forEach((k) => {
+        if (isQualityLabelKey(k)) return;
+        const val = videoSources[k];
+        if (typeof val === 'string' && val.trim().length > 0) {
+          addLang(k);
+        } else if (val && typeof val === 'object' && Object.keys(val).length > 0) {
+          addLang(k);
+        }
+      });
+    }
+
+    // 3. Known content languages from props (e.g. ['Hindi', 'English', 'Japanese'])
+    if (propAvailableLanguages && Array.isArray(propAvailableLanguages) && propAvailableLanguages.length > 0) {
+      propAvailableLanguages.forEach((l) => addLang(l));
+    }
+
+    return list;
+  }, [videoSources, hlsAudioTracks, propAvailableLanguages]);
+
+  // Keep currentLanguage in sync with activeLanguage prop and immediately switch live HLS audio track when changed from Details Screen!
+  useEffect(() => {
+    let targetLang = currentLanguage;
+    const cleanActiveLang = (activeLanguage || '').replace(/\s*\[(S1|S2|S3)\]/i, '').trim();
+    if (cleanActiveLang) {
+      const matched =
+        availableLanguages.find((l) => l.toLowerCase() === cleanActiveLang.toLowerCase()) ||
+        availableLanguages.find((l) =>
+          ClientHlsDownloader.matchesTargetLanguage({ name: l, language: l, friendly: l }, cleanActiveLang)
+        ) ||
+        cleanActiveLang;
+      setCurrentLanguage(matched);
+      targetLang = matched;
+    } else if (availableLanguages.length > 0) {
+      const fallback = availableLanguages[0];
+      setCurrentLanguage(fallback);
+      targetLang = fallback;
+      if (onLanguageChange && !activeLanguage) {
+        onLanguageChange(fallback);
+      }
+    }
+
+    const hls = hlsRef.current;
+    if (hls && isHlsStreamRef.current && hlsAudioTracks.length > 0 && targetLang) {
+      let matchIdx = hlsAudioTracks.findIndex((t) =>
+        ClientHlsDownloader.matchesTargetLanguage(
+          { name: (t as any).rawName || t.name, language: t.lang || '', friendly: t.name },
+          targetLang
+        )
+      );
+      // Only fall back to positional index if HLS tracks have generic/unlabeled names (e.g. Track 1, Audio 1, und)
+      if (matchIdx === -1 && availableLanguages.length > 0) {
+        const allGeneric = hlsAudioTracks.every((t) => {
+          const n = (t.name || '').toLowerCase().trim();
+          return !n || n.startsWith('audio') || n.startsWith('track') || n === 'default' || n === 'und' || n === 'unknown';
+        });
+        if (allGeneric) {
+          const orderIdx = availableLanguages.findIndex(
+            (l) => l.toLowerCase().trim() === targetLang.toLowerCase().trim()
+          );
+          if (orderIdx !== -1 && orderIdx < hlsAudioTracks.length) {
+            matchIdx = orderIdx;
+          }
+        }
+      }
+      if (matchIdx !== -1) {
+        if (
+          hls.audioTrack !== matchIdx ||
+          lastAppliedAudioTrackRef.current.hls !== hls ||
+          lastAppliedAudioTrackRef.current.trackIdx !== matchIdx
+        ) {
+          performInstantHlsAudioSwitch(hls, matchIdx, targetLang, false);
+        }
+      }
+    }
+  }, [activeLanguage, availableLanguages, hlsAudioTracks]);
+
+  const [switchingQualityLabel, setSwitchingQualityLabel] = useState<string | null>(null);
+  const [qualitySwitchDoneBadge, setQualitySwitchDoneBadge] = useState<string | null>(null);
+  const [isInNativePip, setIsInNativePip] = useState<boolean>(false);
+  const prevActiveQualityPropRef = useRef<string | undefined>(activeQuality);
+  const switchFeedbackTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const doneBadgeTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const audioFlushTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const pendingAudioFlushRef = useRef<boolean>(false);
+  const lastAppliedAudioTrackRef = useRef<{ hls: Hls | null; trackIdx: number }>({ hls: null, trackIdx: -1 });
+  const lastCrossServerLangReqRef = useRef<string>('');
+
+  const performInstantHlsAudioSwitch = useCallback(
+    (hls: Hls, matchIdx: number, langLabel?: string, showBadge: boolean = true) => {
+      if (!hls || matchIdx < 0) return;
+      lastAppliedAudioTrackRef.current = { hls, trackIdx: matchIdx };
+      pendingAudioFlushRef.current = true;
+
+      const video = videoRef.current;
+      const wasPaused = video ? video.paused : true;
+
+      if (showBadge && langLabel) {
+        setQualitySwitchDoneBadge(`Audio switched to ${langLabel}`);
+        if (doneBadgeTimerRef.current) clearTimeout(doneBadgeTimerRef.current);
+        doneBadgeTimerRef.current = setTimeout(() => {
+          setQualitySwitchDoneBadge(null);
+        }, 2000);
+      }
+
+      // 1. Switch the active audio track index on hls.js (never call stopLoad() here so the new audio playlist fetch is never aborted!)
+      hls.audioTrack = matchIdx;
+
+      // 2. Fallback micro-seek if track playlist was already cached and AUDIO_TRACK_SWITCHED fired synchronously
+      if (audioFlushTimerRef.current) clearTimeout(audioFlushTimerRef.current);
+      audioFlushTimerRef.current = setTimeout(() => {
+        if (!pendingAudioFlushRef.current) return;
+        pendingAudioFlushRef.current = false;
+        try {
+          if (hlsRef.current !== hls) return;
+          const v = videoRef.current;
+          if (!v || v.readyState < 1) return;
+          if (v.currentTime > 0.2) {
+            try {
+              v.currentTime = v.currentTime + 0.05;
+            } catch {}
+          }
+          if (!wasPaused && v.paused) {
+            v.play().catch(() => {});
+          }
+        } catch {}
+      }, 220);
+    },
+    []
+  );
+
+  const triggerQualitySwitchBanner = useCallback((targetQual: string) => {
+    const cleanQ = (targetQual || 'Auto').toUpperCase();
+    setSwitchingQualityLabel(cleanQ);
+    if (switchFeedbackTimerRef.current) clearTimeout(switchFeedbackTimerRef.current);
+    switchFeedbackTimerRef.current = setTimeout(() => {
+      setSwitchingQualityLabel(null);
+      setQualitySwitchDoneBadge(`Quality switched to ${cleanQ}`);
+      if (doneBadgeTimerRef.current) clearTimeout(doneBadgeTimerRef.current);
+      doneBadgeTimerRef.current = setTimeout(() => {
+        setQualitySwitchDoneBadge(null);
+      }, 2200);
+    }, 950);
+  }, []);
+
+  // Listen for Native Android PiP mode changes so ONLY the video player fills 100% of the PiP window!
+  useEffect(() => {
+    const handleNativePipChange = (inPip: boolean) => {
+      setIsInNativePip(Boolean(inPip));
+      if (inPip) {
+        setShowControls(false);
+        setActiveMenu(null);
+      }
+    };
+    window.__onMaxPlayPipModeChanged = handleNativePipChange;
+
+    const handleResizeCheck = () => {
+      // Android PiP floating window is typically <= 300px wide and <= 220px tall
+      if (window.innerWidth <= 300 && window.innerHeight <= 220) {
+        setIsInNativePip(true);
+        setShowControls(false);
+      } else if (window.innerWidth > 320 && window.innerHeight > 400) {
+        setIsInNativePip(false);
+      }
+    };
+    window.addEventListener('resize', handleResizeCheck);
+    return () => {
+      window.removeEventListener('resize', handleResizeCheck);
+      if (window.__onMaxPlayPipModeChanged === handleNativePipChange) {
+        delete window.__onMaxPlayPipModeChanged;
+      }
+    };
+  }, []);
+
+  // Keep currentQuality in sync with activeQuality prop AND immediately switch live HLS level when changed from Details Screen!
+  useEffect(() => {
+    if (!activeQuality) return;
+    const isExternalQualitySwitch =
+      prevActiveQualityPropRef.current !== undefined &&
+      prevActiveQualityPropRef.current.toLowerCase() !== activeQuality.toLowerCase();
+    prevActiveQualityPropRef.current = activeQuality;
+
+    const hls = hlsRef.current;
+    const hasInPlaceHlsLevels = Boolean(
+      hls && isHlsStreamRef.current && hls.levels && hls.levels.length > 1 && !/\[(S1|S2|S3)\]/i.test(activeQuality)
+    );
+
+    if (isExternalQualitySwitch && hasStarted) {
+      if (videoRef.current && videoRef.current.currentTime > 0.5) {
+        savedSwitchTimeRef.current = videoRef.current.currentTime;
+      }
+      if ((videoRef.current && !videoRef.current.paused) || isPlaying) {
+        wasPlayingBeforeSwitchRef.current = true;
+      }
+      if (!hasInPlaceHlsLevels) {
+        setHasRenderedFirstFrame(false);
+        setIsLoading(true);
+      }
+      triggerQualitySwitchBanner(activeQuality);
+    }
+
+    setCurrentQuality(activeQuality);
+
+    if (hls && isHlsStreamRef.current && hls.levels && hls.levels.length > 0) {
+      if (activeQuality.toLowerCase() === 'auto') {
+        hls.currentLevel = -1;
+        hls.loadLevel = -1;
+        hls.nextLevel = -1;
+      } else {
+        const levelIdx = findMatchingHlsLevelIndex(hls.levels, activeQuality);
+        if (levelIdx !== -1 && (hls.currentLevel !== levelIdx || hls.loadLevel !== levelIdx)) {
+          hls.currentLevel = levelIdx;
+          hls.loadLevel = levelIdx;
+          hls.nextLevel = levelIdx;
+        }
+      }
+    }
+  }, [activeQuality, hasStarted, isPlaying, triggerQualitySwitchBanner]);
+
+  // Derive available qualities based on Admin multi-quality server links AND dynamic HLS levels
+  // Strictly filters out any language names so languages NEVER leak into the Quality Box!
+  const availableQualities = useMemo(() => {
+    let links: Record<string, string> | null = null;
+
+    if (videoSources && typeof videoSources === 'object' && Object.keys(videoSources).length > 0) {
+      const matchedKey =
+        (currentLanguage &&
+          Object.keys(videoSources).find((k) => k.toLowerCase().trim() === currentLanguage.toLowerCase().trim())) ||
+        (availableLanguages.length > 0 &&
+          Object.keys(videoSources).find((k) => k.toLowerCase().trim() === availableLanguages[0].toLowerCase().trim())) ||
+        Object.keys(videoSources)[0];
+      const langVal = matchedKey ? videoSources[matchedKey] : null;
+      if (langVal && typeof langVal === 'object') {
+        const cleanLangLinks: Record<string, string> = {};
+        Object.entries(langVal).forEach(([k, v]) => {
+          if (typeof v === 'string' && v.trim().length > 0) {
+            cleanLangLinks[k.trim()] = v.trim();
+          }
+        });
+        links = {
+          ...(qualityLinks && typeof qualityLinks === 'object' ? qualityLinks : {}),
+          ...cleanLangLinks,
+        };
+      }
+    }
+
+    if (!links && qualityLinks && typeof qualityLinks === 'object' && Object.keys(qualityLinks).length > 0) {
+      links = qualityLinks;
+    }
+
+    const combinedSet = new Set<string>();
+    if (links && typeof links === 'object') {
+      Object.keys(links).forEach((q) => {
+        const cleanQ = q.trim();
+        if (
+          cleanQ.toLowerCase() !== 'default' &&
+          cleanQ.toLowerCase() !== 'auto' &&
+          isQualityLabelKey(cleanQ) &&
+          links![q] &&
+          String(links![q]).trim().length > 0
+        ) {
+          combinedSet.add(cleanQ);
+        }
+      });
+    }
+    if (hlsQualities.length > 0) {
+      hlsQualities.forEach((q) => {
+        const cleanQ = q.trim();
+        if (cleanQ.toLowerCase() !== 'auto' && isQualityLabelKey(cleanQ)) {
+          combinedSet.add(cleanQ);
+        }
+      });
+    }
+
+    if (combinedSet.size > 0 || (crossServerQualities && crossServerQualities.length > 0)) {
+      const sortedCurrent = Array.from(combinedSet).sort((a, b) => (parseInt(b) || 0) - (parseInt(a) || 0));
+      const crossList = (crossServerQualities || []).filter(
+        (cq) => cq && /\[(S1|S2|S3)\]/i.test(cq)
+      );
+      return ['auto', ...sortedCurrent, ...crossList];
+    }
+
+    return ['auto'];
+  }, [videoSources, qualityLinks, currentLanguage, availableLanguages, hlsQualities, crossServerQualities, selectedServer]);
+
+  // Pick the optimal video URL based on active server qualityLinks, language, and quality
+  const activeVideoUrl = useMemo(() => {
+    let links: Record<string, string> | null = null;
+    let langStringUrl = '';
+
+    if (videoSources && typeof videoSources === 'object' && Object.keys(videoSources).length > 0) {
+      const matchedKey =
+        (currentLanguage &&
+          Object.keys(videoSources).find((k) => k.toLowerCase().trim() === currentLanguage.toLowerCase().trim())) ||
+        (availableLanguages.length > 0 &&
+          Object.keys(videoSources).find((k) => k.toLowerCase().trim() === availableLanguages[0].toLowerCase().trim())) ||
+        Object.keys(videoSources)[0];
+      const langVal = matchedKey ? videoSources[matchedKey] : null;
+      if (langVal && typeof langVal === 'object') {
+        const cleanLangLinks: Record<string, string> = {};
+        Object.entries(langVal).forEach(([k, v]) => {
+          if (typeof v === 'string' && v.trim().length > 0) {
+            cleanLangLinks[k.trim()] = v.trim();
+          }
+        });
+        links = {
+          ...(qualityLinks && typeof qualityLinks === 'object' ? qualityLinks : {}),
+          ...cleanLangLinks,
+        };
+      } else if (typeof langVal === 'string' && langVal.trim().length > 0) {
+        langStringUrl = SmartStreamService.sanitizeStreamUrl(langVal);
+      }
+    }
+
+    if (!links && qualityLinks && typeof qualityLinks === 'object' && Object.keys(qualityLinks).length > 0) {
+      links = qualityLinks;
+    }
+
+    if (links && typeof links === 'object' && Object.keys(links).length > 0) {
+      const smartSelected = SmartStreamService.selectSourceUrlForQuality(
+        langStringUrl || videoUrl,
+        links,
+        currentQuality
+      );
+      const candidate = smartSelected.chosenUrl || smartSelected.url;
+
+      // Override candidate with videoUrl if candidate is an expired temporary HLS token AND videoUrl is a permanent extractable source
+      if (
+        videoUrl &&
+        SmartStreamService.isExtractableSource(videoUrl, isSmartHls) &&
+        candidate &&
+        (!SmartStreamService.isExtractableSource(candidate, isSmartHls) ||
+          SmartStreamService.isTemporaryHlsUrl(candidate))
+      ) {
+        return SmartStreamService.sanitizeStreamUrl(videoUrl);
+      }
+
+      if (candidate) return SmartStreamService.sanitizeStreamUrl(candidate);
+    }
+
+    if (langStringUrl) return langStringUrl;
+    if (videoUrl) return SmartStreamService.sanitizeStreamUrl(videoUrl);
+    return '';
+  }, [qualityLinks, videoSources, videoUrl, currentLanguage, currentQuality, availableLanguages, isSmartHls, selectedServer]);
+
+
+  const [embedFallbackUrl, setEmbedFallbackUrl] = useState<string>('');
+
+  // Reset embed fallback when active source URL changes
+  useEffect(() => {
+    setEmbedFallbackUrl('');
+  }, [activeVideoUrl]);
+
+  const { isIframe, iframeUrl } = useMemo(() => {
+    const isExtractable = SmartStreamService.isExtractableSource(activeVideoUrl, isSmartHls);
+    if (embedFallbackUrl && !isExtractable) {
+      return { isIframe: true, iframeUrl: embedFallbackUrl };
+    }
+    if (!activeVideoUrl || isExtractable) return { isIframe: false, iframeUrl: '' };
+    try {
+      const urlStr = activeVideoUrl;
+      const lower = urlStr.toLowerCase();
+      
+      if (lower.includes('youtube.com/watch?v=')) {
+        const v = new URL(urlStr).searchParams.get('v');
+        return { isIframe: true, iframeUrl: `https://www.youtube.com/embed/${v}?autoplay=1&rel=0` };
+      }
+      if (lower.includes('youtu.be/')) {
+        const v = urlStr.split('youtu.be/')[1].split('?')[0];
+        return { isIframe: true, iframeUrl: `https://www.youtube.com/embed/${v}?autoplay=1&rel=0` };
+      }
+      if (lower.includes('drive.google.com/file/d/')) {
+        return { isIframe: true, iframeUrl: urlStr.replace('/view', '/preview') };
+      }
+      if (lower.includes('vimeo.com/')) {
+        const v = urlStr.split('vimeo.com/')[1].split('?')[0];
+        if (!isNaN(Number(v))) {
+          return { isIframe: true, iframeUrl: `https://player.vimeo.com/video/${v}?autoplay=1` };
+        }
+      }
+      if (lower.includes('dailymotion.com/video/')) {
+        const v = urlStr.split('video/')[1].split('?')[0];
+        return { isIframe: true, iframeUrl: `https://www.dailymotion.com/embed/video/${v}?autoplay=1` };
+      }
+      if (lower.includes('/embed/') || lower.includes('/iframe/')) {
+        return { isIframe: true, iframeUrl: urlStr };
+      }
+    } catch (e) {
+      console.warn("Error parsing iframe url", e);
+    }
+    return { isIframe: false, iframeUrl: '' };
+  }, [activeVideoUrl, embedFallbackUrl, isSmartHls]);
+
+  // Sync active video playing state with Native Android PiP Bridge and In-App Miniplayer state
+  useEffect(() => {
+    const autoPipEnabled = localStorage.getItem('maxplay_auto_miniplayer') !== 'false';
+    NativeBridgeService.setAutoPipEnabled(autoPipEnabled);
+    NativeBridgeService.setVideoPlayingState(Boolean(isPlaying && resolvedStreamUrl));
+  }, [isPlaying, resolvedStreamUrl]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      (window as any).__maxplayActivePlaybackState = {
+        streamUrl: resolvedStreamUrl,
+        currentTime: videoRef.current?.currentTime || currentTime || 0,
+        isPlaying: Boolean(isPlaying || (videoRef.current && !videoRef.current.paused)),
+        isIframe: Boolean(isIframe),
+      };
+    }
+  }, [resolvedStreamUrl, currentTime, isPlaying, isIframe]);
+
+  useEffect(() => {
+    return () => {
+      NativeBridgeService.setVideoPlayingState(false);
+    };
+  }, []);
+
+  const lastActiveUrlRef = useRef<string>('');
+  const isSwitchingSourceRef = useRef<boolean>(false);
+  const targetSeekTimeRef = useRef<number>(initialTime);
+  const savedSwitchTimeRef = useRef<number>(0);
+  const wasPlayingBeforeSwitchRef = useRef<boolean>(false);
+  const networkStruggleCountRef = useRef<number>(0);
+  const decodeErrorRetryCountRef = useRef<number>(0);
+  const isInitialSeekDoneRef = useRef<boolean>(initialTime <= 0);
+
+  useEffect(() => {
+    decodeErrorRetryCountRef.current = 0;
+  }, [resolvedStreamUrl, streamKey]);
+
+  // Expose helper to enter Native Android PiP or Web PiP when pressing Back on Details Screen
+  useEffect(() => {
+    const enterPipOnBack = (): boolean => {
+      try {
+        const video = videoRef.current;
+        const activelyPlaying = Boolean(
+          resolvedStreamUrl && (isPlaying || hasStarted || (video && !video.paused && video.currentTime > 0))
+        );
+        if (!activelyPlaying) return false;
+
+        if (typeof NativeBridgeService.isNativeAndroid === 'function' && NativeBridgeService.isNativeAndroid()) {
+          const entered = NativeBridgeService.enterNativePipMode();
+          if (entered) {
+            setIsInNativePip(true);
+            setShowControls(false);
+            setActiveMenu(null);
+            return true;
+          }
+        }
+
+        if (video && typeof (video as any).requestPictureInPicture === 'function' && !(document as any).pictureInPictureElement) {
+          (video as any).requestPictureInPicture().catch(() => {});
+          return true;
+        }
+      } catch {}
+      return false;
+    };
+    (window as any).__enterMaxPlayPipOnBack = enterPipOnBack;
+    return () => {
+      if ((window as any).__enterMaxPlayPipOnBack === enterPipOnBack) {
+        delete (window as any).__enterMaxPlayPipOnBack;
+      }
+    };
+  }, [resolvedStreamUrl, isPlaying, hasStarted]);
+
+  // Smart Network Auto-Downgrade helper: ONLY steps down when user has selected 'auto' (Auto Smart).
+  // When user manually selects a specific quality (e.g. 1080p, 720p, 480p), NEVER auto-switch quality!
+  const tryStepDownToWeakerQuality = useCallback((): boolean => {
+    if (currentQuality.toLowerCase() !== 'auto') {
+      return false;
+    }
+
+    // If HLS stream with internal levels is active in Auto mode, let HLS ABR drop to lowest/next level smoothly
+    if (hlsRef.current && hlsRef.current.levels && hlsRef.current.levels.length > 1) {
+      const curLvl = hlsRef.current.currentLevel;
+      if (curLvl > 0) {
+        hlsRef.current.nextLoadLevel = Math.max(0, curLvl - 1);
+      }
+      hlsRef.current.loadLevel = -1;
+      hlsRef.current.nextLevel = -1;
+      return true;
+    }
+
+    const ladder = ['1080p', '720p', '480p', '360p'];
+    const currQ = actualQuality || '1080p';
+    const currIdx = ladder.findIndex((q) => currQ.toLowerCase().includes(q.replace('p', '')));
+    const startIdx = currIdx !== -1 ? currIdx + 1 : 1;
+
+    for (let i = startIdx; i < ladder.length; i++) {
+      const candidateQ = ladder[i];
+      if (availableQualities.some((q) => q.toLowerCase() === candidateQ.toLowerCase())) {
+        console.warn(`[SmartPlayer] Auto (Smart) detected weak network on ${currQ}. Stepping down to ${candidateQ}...`);
+        setActualQuality(candidateQ.toUpperCase());
+        return true;
+      }
+    }
+    return false;
+  }, [currentQuality, actualQuality, availableQualities]);
+
+  // When selectedServer switches (Server 1 <-> Server 2), preserve timestamp & quality while showing poster until new stream's first frame loads
+  useEffect(() => {
+    if (prevServerRef.current !== selectedServer) {
+      prevServerRef.current = selectedServer;
+      const liveVideoTime = videoRef.current?.currentTime || 0;
+      const bestTime = Math.max(liveVideoTime, currentTime, savedSwitchTimeRef.current);
+      if (bestTime > 0.5) {
+        savedSwitchTimeRef.current = bestTime;
+      }
+      if ((videoRef.current && !videoRef.current.paused) || isPlaying || hasStarted) {
+        wasPlayingBeforeSwitchRef.current = true;
+      }
+      setHasRenderedFirstFrame(false);
+      setIsLoading(true);
+      setHlsQualities([]);
+      setHlsAudioTracks([]);
+      setEmbedFallbackUrl('');
+      setPlaybackError(null);
+    }
+  }, [selectedServer, currentTime, isPlaying, hasStarted]);
+
+  // Resolve Smart Stream URL (VOE / external hosters via backend proxy with 3-hour cache)
+  useEffect(() => {
+    if (!activeVideoUrl) {
+      setResolvedStreamUrl('');
+      setIsResolvingStream(false);
+      return;
+    }
+
+    // Show poster while resolving or switching active stream URL until the first frame of the new source loads
+    setHasRenderedFirstFrame(false);
+
+    // Preserve current playback position BEFORE resolving new quality/server link
+    if (prevStreamKeyRef.current === streamKey) {
+      const liveVideoTime = videoRef.current?.currentTime || 0;
+      const bestTime = Math.max(liveVideoTime, currentTime, savedSwitchTimeRef.current);
+      if (bestTime > 0.5) {
+        savedSwitchTimeRef.current = bestTime;
+      }
+      if ((videoRef.current && !videoRef.current.paused) || isPlaying || hasStarted) {
+        wasPlayingBeforeSwitchRef.current = true;
+      }
+    }
+
+    streamRetryAttemptedRef.current = false;
+
+    if (isIframe) {
+      setResolvedStreamUrl(activeVideoUrl);
+      setIsResolvingStream(false);
+      return;
+    }
+
+    if (!SmartStreamService.isExtractableSource(activeVideoUrl, isSmartHls)) {
+      setResolvedStreamUrl(activeVideoUrl);
+      setIsResolvingStream(false);
+      return;
+    }
+
+    let isMounted = true;
+    setIsResolvingStream(true);
+    setIsLoading(true);
+
+    SmartStreamService.resolveStream(activeVideoUrl, { forceRefresh: false })
+      .then(async (res) => {
+        if (!isMounted) return;
+        const isExtractable = SmartStreamService.isExtractableSource(activeVideoUrl, isSmartHls);
+        // If first extraction returned an embed fallback for a Voe/Filemoon/Byse stream:
+        // First check if we can immediately fail over to an active backup server (Server 2 / Server 3)
+        // so the user never waits on a dead provider!
+        let finalRes = res;
+        if (res.isEmbed && isExtractable) {
+          if (onRequestServerFailover && onRequestServerFailover(selectedServer)) {
+            return;
+          }
+          try {
+            SmartStreamService.clearClientCache(activeVideoUrl);
+            const retryRes = await SmartStreamService.resolveStream(activeVideoUrl, { forceRefresh: true });
+            if (!isMounted) return;
+            if (retryRes && retryRes.streamUrl && !retryRes.isEmbed) {
+              finalRes = retryRes;
+            }
+          } catch {}
+        }
+        if (finalRes.isEmbed && !isExtractable) {
+          setEmbedFallbackUrl(finalRes.streamUrl);
+          setResolvedStreamUrl('');
+        } else if (finalRes.isEmbed && isExtractable) {
+          if (onRequestServerFailover && onRequestServerFailover(selectedServer)) {
+            return;
+          }
+          // Never force an iframe for extractable Voe/Filemoon/Byse sources — keep player in native HLS mode
+          setEmbedFallbackUrl('');
+          setIsLoading(false);
+          setPlaybackError('Stream is temporarily busy. Tap Retry to reload.');
+        } else {
+          setResolvedStreamUrl(finalRes.streamUrl);
+          setEmbedFallbackUrl('');
+        }
+        setIsResolvingStream(false);
+      })
+      .catch((err) => {
+        if (!isMounted) return;
+        console.warn('Smart stream extraction error:', err);
+        // If targeted quality link failed to extract, try stepping down to a weaker quality link automatically!
+        if (tryStepDownToWeakerQuality()) {
+          return;
+        }
+        if (onRequestServerFailover && onRequestServerFailover(selectedServer)) {
+          return;
+        }
+        setIsResolvingStream(false);
+        setIsLoading(false);
+        setPlaybackError(err.message || 'Failed to extract video stream. Please try again.');
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [activeVideoUrl, isIframe, isSmartHls]);
+
+  // Handle streamKey changes: When switching between Episode Parts or Episodes,
+  // do NOT retain previous part timestamp; start from initialTime!
+  useEffect(() => {
+    if (streamKey !== prevStreamKeyRef.current) {
+      prevStreamKeyRef.current = streamKey;
+      lastActiveUrlRef.current = '';
+      savedSwitchTimeRef.current = 0;
+      wasPlayingBeforeSwitchRef.current = false;
+      networkStruggleCountRef.current = 0;
+      setCurrentTime(initialTime);
+      targetSeekTimeRef.current = initialTime;
+      isInitialSeekDoneRef.current = initialTime <= 0;
+      setAutoShowSkip(false);
+      if (lastActiveMarkerKeyRef.current !== null) {
+        lastActiveMarkerKeyRef.current = null;
+      }
+      if (videoRef.current) {
+        try {
+          videoRef.current.currentTime = initialTime;
+        } catch (e) {
+          console.warn('streamKey change seek error:', e);
+        }
+      }
+    }
+  }, [streamKey, initialTime]);
+
+  // Setup HLS or Native Video
+  useEffect(() => {
+    if (isIframe) {
+      setIsLoading(false);
+      setHasStarted(true);
+      setIsPlaying(true);
+      return;
+    }
+    const video = videoRef.current;
+    if (!video || !resolvedStreamUrl) return;
+
+    // Check if this is a quality/language/server switch on the same streamKey
+    const isSameStreamSwitch =
+      prevStreamKeyRef.current === streamKey &&
+      Boolean(lastActiveUrlRef.current && lastActiveUrlRef.current !== resolvedStreamUrl);
+    lastActiveUrlRef.current = resolvedStreamUrl;
+
+    let targetStartTime = initialTime;
+    const bestSavedTime = Math.max(video.currentTime || 0, savedSwitchTimeRef.current || 0);
+    if (isSameStreamSwitch && bestSavedTime > 0.5) {
+      targetStartTime = bestSavedTime;
+      isSwitchingSourceRef.current = true;
+    } else {
+      targetStartTime = initialTime;
+      isInitialSeekDoneRef.current = initialTime <= 0;
+    }
+    targetSeekTimeRef.current = targetStartTime;
+
+    setHasRenderedFirstFrame(false);
+    setIsLoading(true);
+    setPlaybackError(null);
+
+    // Destroy old HLS instance
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+
+    const lowerResolved = resolvedStreamUrl.toLowerCase();
+    const isHls =
+      lowerResolved.includes('.m3u8') ||
+      lowerResolved.includes('m3u8') ||
+      lowerResolved.includes('master.txt') ||
+      lowerResolved.includes('urlset');
+    isHlsStreamRef.current = isHls;
+
+    if (isHls && Hls.isSupported()) {
+      const hls = new Hls({
+        startPosition: targetStartTime > 0 ? targetStartTime : -1,
+        enableWorker: true,
+        lowLatencyMode: false,
+        startFragPrefetch: true,
+        backBufferLength: 30,
+        maxBufferLength: 18,
+        maxMaxBufferLength: 36,
+        maxBufferSize: 80 * 1000 * 1000,
+        maxBufferHole: 0.5,
+        highBufferWatchdogPeriod: 2,
+        nudgeOffset: 0.1,
+        nudgeMaxRetry: 8,
+        abrEwmaDefaultEstimate: 2500000,
+        fragLoadingTimeOut: 90000,
+        fragLoadingMaxRetry: 8,
+        fragLoadingRetryDelay: 400,
+        manifestLoadingTimeOut: 25000,
+        manifestLoadingMaxRetry: 5,
+        manifestLoadingRetryDelay: 350,
+        levelLoadingTimeOut: 25000,
+        levelLoadingMaxRetry: 5,
+        levelLoadingRetryDelay: 350,
+        fragLoadPolicy: {
+          default: {
+            maxTimeToFirstByteMs: 20000,
+            maxLoadTimeMs: 90000,
+            timeoutRetry: {
+              maxNumRetry: 6,
+              retryDelayMs: 400,
+              maxRetryDelayMs: 4000,
+            },
+            errorRetry: {
+              maxNumRetry: 6,
+              retryDelayMs: 500,
+              maxRetryDelayMs: 5000,
+            },
+          },
+        },
+      });
+      hlsRef.current = hls;
+      hls.loadSource(resolvedStreamUrl);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
+        setIsLoading(false);
+        video.playbackRate = playbackRate;
+
+        // 1. Auto-detect available qualities from HLS master manifest using widescreen-aware classifier
+        if (data && data.levels && data.levels.length > 0) {
+          const classifiedLabels = data.levels.map((lvl: any) =>
+            ClientHlsDownloader.classifyResolutionLabel(lvl.width || 0, lvl.height || 0, lvl.bitrate || 0)
+          );
+          const uniqueQualities = Array.from(new Set(classifiedLabels)).sort(
+            (a, b) => (parseInt(b) || 0) - (parseInt(a) || 0)
+          );
+          if (uniqueQualities.length > 0) {
+            setHlsQualities(uniqueQualities);
+            if (onDiscoveredQualities) {
+              onDiscoveredQualities(uniqueQualities);
+            }
+          }
+
+          // Immediately lock onto the user's targeted/selected quality level!
+          const desiredQ = currentQuality || activeQuality || 'auto';
+          if (desiredQ && desiredQ.toLowerCase() !== 'auto') {
+            const targetLevelIdx = findMatchingHlsLevelIndex(data.levels, desiredQ);
+            if (targetLevelIdx !== -1) {
+              hls.currentLevel = targetLevelIdx;
+              hls.loadLevel = targetLevelIdx;
+              hls.startLevel = targetLevelIdx;
+            }
+          }
+        }
+
+        // 2. Auto-detect audio tracks from HLS
+        if (hls.audioTracks && hls.audioTracks.length > 0) {
+          const parsedAudio = hls.audioTracks.map((t, idx) => ({
+            id: idx,
+            name: formatLanguageLabel(t.name, t.lang, idx),
+            rawName: t.name || '',
+            lang: t.lang || '',
+          }));
+          setHlsAudioTracks(parsedAudio);
+          if (onDiscoveredAudioTracks) {
+            onDiscoveredAudioTracks(
+              Array.from(new Set(parsedAudio.map((a) => a.name).filter(Boolean)))
+            );
+          }
+
+          const req = (activeLanguage || currentLanguage || '').trim();
+          if (req) {
+            const matchIdx = parsedAudio.findIndex((a) =>
+              ClientHlsDownloader.matchesTargetLanguage(
+                { name: a.rawName, language: a.lang, friendly: a.name },
+                req
+              )
+            );
+            if (matchIdx !== -1) {
+              lastAppliedAudioTrackRef.current = { hls, trackIdx: matchIdx };
+              if (hls.audioTrack !== matchIdx) {
+                hls.audioTrack = matchIdx;
+              }
+            }
+          }
+        }
+
+        if (targetSeekTimeRef.current > 0.5 && Math.abs((video.currentTime || 0) - targetSeekTimeRef.current) > 1.5) {
+          try {
+            video.currentTime = targetSeekTimeRef.current;
+          } catch {}
+        }
+
+        setTimeout(() => {
+          isInitialSeekDoneRef.current = true;
+          isSwitchingSourceRef.current = false;
+          targetSeekTimeRef.current = 0;
+          savedSwitchTimeRef.current = 0;
+        }, 450);
+
+        if (autoPlay || hasStarted || isPlaying || wasPlayingBeforeSwitchRef.current) {
+          wasPlayingBeforeSwitchRef.current = false;
+          setHasStarted(true);
+          video.play().catch((e) => {
+            if (e?.name !== 'AbortError') console.warn('Autoplay blocked:', e);
+          });
+        }
+      });
+
+      hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_event, data) => {
+        if (data.audioTracks && data.audioTracks.length > 0) {
+          const parsedAudio = data.audioTracks.map((t: any, idx: number) => ({
+            id: idx,
+            name: formatLanguageLabel(t.name, t.lang, idx),
+            rawName: t.name || '',
+            lang: t.lang || '',
+          }));
+          setHlsAudioTracks(parsedAudio);
+          if (onDiscoveredAudioTracks) {
+            onDiscoveredAudioTracks(
+              Array.from(new Set(parsedAudio.map((a: any) => a.name).filter(Boolean)))
+            );
+          }
+
+          const req = (activeLanguage || currentLanguage || '').trim();
+          if (req) {
+            const matchIdx = parsedAudio.findIndex((a: any) =>
+              ClientHlsDownloader.matchesTargetLanguage(
+                { name: a.rawName, language: a.lang, friendly: a.name },
+                req
+              )
+            );
+            if (matchIdx !== -1) {
+              lastAppliedAudioTrackRef.current = { hls, trackIdx: matchIdx };
+              if (hls.audioTrack !== matchIdx) {
+                hls.audioTrack = matchIdx;
+              }
+            }
+          }
+        }
+      });
+
+      hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (_event, data) => {
+        // When a user-initiated audio switch completes loading the new track playlist, flush old buffered audio via a 50ms micro-seek
+        if (pendingAudioFlushRef.current) {
+          pendingAudioFlushRef.current = false;
+          if (audioFlushTimerRef.current) {
+            clearTimeout(audioFlushTimerRef.current);
+            audioFlushTimerRef.current = null;
+          }
+          if (video.readyState >= 1 && video.currentTime > 0.2) {
+            const wasPausedNow = video.paused;
+            try {
+              video.currentTime = video.currentTime + 0.05;
+            } catch {}
+            if (!wasPausedNow && video.paused) {
+              video.play().catch(() => {});
+            }
+          }
+        }
+
+        if (hls.audioTracks && hls.audioTracks.length > 1 && hls.audioTracks[data.id]) {
+          const trk = hls.audioTracks[data.id];
+          const friendly = formatLanguageLabel(trk.name, trk.lang, data.id);
+          // Only update currentLanguage from AUDIO_TRACK_SWITCHED if no explicit activeLanguage is set,
+          // or if the switched track actually matches the user's requested language.
+          // This prevents initial default track 0 from overwriting the user's selected language!
+          const requestedLang = (activeLanguage || '').trim();
+          const matchesRequested =
+            !requestedLang ||
+            ClientHlsDownloader.matchesTargetLanguage(
+              { name: trk.name || '', language: trk.lang || '', friendly },
+              requestedLang
+            );
+          if (
+            matchesRequested &&
+            friendly &&
+            !friendly.toLowerCase().startsWith('audio track') &&
+            friendly.toLowerCase() !== 'default' &&
+            friendly.toLowerCase() !== 'und' &&
+            friendly.toLowerCase() !== 'unknown'
+          ) {
+            setCurrentLanguage(friendly);
+          }
+        }
+      });
+
+      hls.on(Hls.Events.LEVEL_SWITCHED, (_event, data) => {
+        if (hls.levels && hls.levels[data.level]) {
+          const lvl = hls.levels[data.level];
+          const label = ClientHlsDownloader.classifyResolutionLabel(
+            lvl.width || 0,
+            lvl.height || 0,
+            lvl.bitrate || 0
+          );
+          setActualQuality(label);
+          if (video.readyState >= 2 && !video.paused) {
+            setHasRenderedFirstFrame(true);
+            setIsLoading(false);
+          }
+          setSwitchingQualityLabel((prev) => {
+            if (prev) {
+              if (switchFeedbackTimerRef.current) clearTimeout(switchFeedbackTimerRef.current);
+              setQualitySwitchDoneBadge(`Quality switched to ${label.toUpperCase()}`);
+              if (doneBadgeTimerRef.current) clearTimeout(doneBadgeTimerRef.current);
+              doneBadgeTimerRef.current = setTimeout(() => setQualitySwitchDoneBadge(null), 2200);
+            }
+            return null;
+          });
+        }
+      });
+
+      hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
+        if (data?.frag?.type === 'audio' && hls.audioTracks && hls.audioTracks.length > 1) {
+          const fragBytes = Number(data.frag.stats?.total || data.frag.stats?.loaded || 0);
+          // Detect corrupt 376-byte empty MPEG-TS audio segments (0 audio frames) on SprintCDN/Byse
+          if (fragBytes > 0 && fragBytes < 1500) {
+            const nextValidTrack = hls.audioTracks.findIndex((_, idx) => idx !== hls.audioTrack);
+            if (nextValidTrack !== -1) {
+              console.warn(`[SmartPlayer] Empty audio segment (${fragBytes}B) on track ${hls.audioTrack}; switching to valid audio track ${nextValidTrack}`);
+              hls.audioTrack = nextValidTrack;
+            }
+          }
+        }
+      });
+
+      hls.on(Hls.Events.FRAG_BUFFERED, () => {
+        if (video.readyState >= 2 && (isPlaying || !video.paused || video.currentTime > 0.05)) {
+          setHasRenderedFirstFrame(true);
+          setIsLoading(false);
+        }
+      });
+
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        // Non-fatal buffer stall / fragment timeout detection -> Smart Auto-Downgrade to weaker quality!
+        if (
+          !data.fatal &&
+          (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
+            data.details === Hls.ErrorDetails.FRAG_LOAD_TIMEOUT ||
+            data.details === Hls.ErrorDetails.FRAG_LOAD_ERROR)
+        ) {
+          networkStruggleCountRef.current += 1;
+          if (networkStruggleCountRef.current >= 2) {
+            networkStruggleCountRef.current = 0;
+            tryStepDownToWeakerQuality();
+          }
+        }
+
+        if (data.fatal) {
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR: {
+              // 1. Only unwrap /proxy/m3u8?url=... inside the native Kotlin APK where WebView injects Referer directly.
+              // In web browsers, SprintCDN/Byse streams MUST stay routed through /proxy/m3u8 (unwrapping causes 403/CORS).
+              if (
+                NativeBridgeService.isRunningInKotlinApp() &&
+                resolvedStreamUrl.includes('/proxy/m3u8?url=')
+              ) {
+                try {
+                  const u = new URL(resolvedStreamUrl, window.location.origin);
+                  const rawTarget = u.searchParams.get('url');
+                  if (rawTarget) {
+                    const decodedRaw = decodeURIComponent(rawTarget).trim();
+                    if (decodedRaw && decodedRaw !== resolvedStreamUrl) {
+                      console.warn('[SmartPlayer] Proxy manifest failed in APK; switching to direct CDN stream...');
+                      setResolvedStreamUrl(decodedRaw);
+                      return;
+                    }
+                  }
+                } catch {}
+              }
+
+              // 2. First attempt seamless recovery via hls.startLoad() on transient segment/playlist timeouts
+              if (networkStruggleCountRef.current < 2) {
+                networkStruggleCountRef.current += 1;
+                console.warn('[SmartPlayer] Transient network error, recovering via hls.startLoad()...');
+                hls.startLoad();
+                return;
+              }
+
+              // 3. Try stepping down to a weaker quality if user's connection can't sustain high bitrate
+              if (tryStepDownToWeakerQuality()) {
+                networkStruggleCountRef.current = 0;
+                hls.startLoad();
+                return;
+              }
+
+              // 4. Smart retry if 3-hour stream token expired (only once, and NEVER fallback to iframe!)
+              if (
+                SmartStreamService.isExtractableSource(activeVideoUrl, isSmartHls) &&
+                !streamRetryAttemptedRef.current
+              ) {
+                streamRetryAttemptedRef.current = true;
+                console.warn('HLS token expired or network rejected. Auto-renewing stream link...');
+                setIsLoading(true);
+                SmartStreamService.clearClientCache(activeVideoUrl);
+                SmartStreamService.resolveStream(activeVideoUrl, { forceRefresh: true })
+                  .then((res) => {
+                    if (!res.isEmbed && res.streamUrl && res.streamUrl !== resolvedStreamUrl) {
+                      setResolvedStreamUrl(res.streamUrl);
+                      setEmbedFallbackUrl('');
+                    } else {
+                      setIsLoading(false);
+                      hls.startLoad();
+                    }
+                  })
+                  .catch(() => {
+                    setIsLoading(false);
+                    hls.startLoad();
+                  });
+                return;
+              }
+
+              console.warn('fatal network error encountered, checking retry limit');
+              if (networkStruggleCountRef.current < 4) {
+                networkStruggleCountRef.current += 1;
+                hls.startLoad();
+              } else {
+                setIsLoading(false);
+                setPlaybackError('Video stream connection temporarily lost. Please tap Retry.');
+              }
+              break;
+            }
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              console.warn('fatal media error encountered, try to recover');
+              const now = performance.now();
+              if (now - recoverDecodingErrorDateRef.current > 3000) {
+                recoverDecodingErrorDateRef.current = now;
+                hls.recoverMediaError();
+              } else {
+                console.warn('media error recurring, swapping audio codec to prevent decode crash');
+                hls.swapAudioCodec();
+                hls.recoverMediaError();
+              }
+              break;
+            default:
+              if (tryStepDownToWeakerQuality()) return;
+              setIsLoading(false);
+              isSwitchingSourceRef.current = false;
+              setPlaybackError('Stream failed to load: ' + data.type);
+              break;
+          }
+        }
+      });
+    } else {
+      // Native HTML5 playback (used for Server 3 Streamtape progressive MP4 & direct MP4/MKV streams)
+      let cancelled = false;
+      let stallTimer: ReturnType<typeof setTimeout> | null = null;
+      let nativeStallRetried = false;
+
+      video.preload = 'auto';
+      video.src = resolvedStreamUrl;
+      video.playbackRate = playbackRate;
+
+      const performNativeSeek = () => {
+        if (cancelled) return;
+        if (targetSeekTimeRef.current > 0 && videoRef.current) {
+          try {
+            videoRef.current.currentTime = targetSeekTimeRef.current;
+          } catch (e) {
+            console.warn('Native seek error:', e);
+          }
+        }
+        setTimeout(() => {
+          if (cancelled) return;
+          isInitialSeekDoneRef.current = true;
+          isSwitchingSourceRef.current = false;
+          targetSeekTimeRef.current = 0;
+          savedSwitchTimeRef.current = 0;
+          wasPlayingBeforeSwitchRef.current = false;
+        }, 400);
+      };
+
+      const onCanPlay = () => {
+        if (cancelled) return;
+        if (stallTimer) {
+          clearTimeout(stallTimer);
+          stallTimer = null;
+        }
+        setIsLoading(false);
+        const shouldResume = autoPlay || hasStarted || isPlaying || wasPlayingBeforeSwitchRef.current;
+        performNativeSeek();
+
+        if (shouldResume) {
+          setHasStarted(true);
+          video.play().catch((e) => {
+            if (e?.name !== 'AbortError') {
+              console.warn('Native autoplay blocked:', e);
+            }
+          });
+        }
+      };
+
+      const onCanPlayThrough = () => {
+        if (cancelled) return;
+        if (stallTimer) {
+          clearTimeout(stallTimer);
+          stallTimer = null;
+        }
+        setIsLoading(false);
+      };
+
+      const onStalled = () => {
+        if (cancelled || nativeStallRetried || video.paused) return;
+        if (stallTimer) clearTimeout(stallTimer);
+        stallTimer = setTimeout(() => {
+          if (cancelled || nativeStallRetried || video.paused || video.readyState >= 3) return;
+          nativeStallRetried = true;
+          const resumeAt = video.currentTime || 0;
+          if (resumeAt > 0.5) {
+            targetSeekTimeRef.current = resumeAt;
+            savedSwitchTimeRef.current = resumeAt;
+            isInitialSeekDoneRef.current = false;
+          }
+          wasPlayingBeforeSwitchRef.current = true;
+          try {
+            video.load();
+          } catch {}
+        }, 12000);
+      };
+
+      video.addEventListener('loadedmetadata', performNativeSeek);
+      video.addEventListener('canplay', onCanPlay);
+      video.addEventListener('canplaythrough', onCanPlayThrough);
+      video.addEventListener('stalled', onStalled);
+      video.load();
+
+      return () => {
+        cancelled = true;
+        if (stallTimer) clearTimeout(stallTimer);
+        video.removeEventListener('loadedmetadata', performNativeSeek);
+        video.removeEventListener('canplay', onCanPlay);
+        video.removeEventListener('canplaythrough', onCanPlayThrough);
+        video.removeEventListener('stalled', onStalled);
+        if (hlsRef.current) {
+          hlsRef.current.destroy();
+          hlsRef.current = null;
+        }
+      };
+    }
+
+    return () => {
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+    };
+  }, [resolvedStreamUrl, streamKey]); 
+
+  // Fullscreen listener with cross-browser / mobile vendor support
+  useEffect(() => {
+    const handleFsChange = () => {
+      const isFs = !!(
+        document.fullscreenElement ||
+        (document as any).webkitFullscreenElement ||
+        (document as any).mozFullScreenElement ||
+        (document as any).msFullscreenElement
+      );
+      setIsFullscreen(isFs);
+    };
+
+    document.addEventListener('fullscreenchange', handleFsChange);
+    document.addEventListener('webkitfullscreenchange', handleFsChange);
+    document.addEventListener('mozfullscreenchange', handleFsChange);
+    document.addEventListener('MSFullscreenChange', handleFsChange);
+
+    return () => {
+      document.removeEventListener('fullscreenchange', handleFsChange);
+      document.removeEventListener('webkitfullscreenchange', handleFsChange);
+      document.removeEventListener('mozfullscreenchange', handleFsChange);
+      document.removeEventListener('MSFullscreenChange', handleFsChange);
+    };
+  }, []);
+
+  // Picture in Picture listeners to keep exact playback state synchronized without resetting
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const handleEnterPip = () => {
+      setCurrentTime(video.currentTime);
+      setIsPlaying(!video.paused);
+      targetSeekTimeRef.current = 0;
+      isInitialSeekDoneRef.current = true;
+    };
+
+    const handleLeavePip = () => {
+      const curTime = video.currentTime;
+      setCurrentTime(curTime);
+      setIsPlaying(!video.paused);
+      targetSeekTimeRef.current = 0;
+      isInitialSeekDoneRef.current = true;
+      if (!video.paused) {
+        video.play().catch(console.warn);
+      }
+    };
+
+    video.addEventListener('enterpictureinpicture', handleEnterPip);
+    video.addEventListener('leavepictureinpicture', handleLeavePip);
+
+    return () => {
+      video.removeEventListener('enterpictureinpicture', handleEnterPip);
+      video.removeEventListener('leavepictureinpicture', handleLeavePip);
+    };
+  }, []);
+
+  // Direct, instant Play / Pause handler
+  const handlePlayPause = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (video.paused) {
+      setHasStarted(true);
+      setIsPlaying(true);
+      video.play().catch((err) => {
+        console.warn('Video play error:', err);
+        setIsPlaying(false);
+      });
+    } else {
+      video.pause();
+      setIsPlaying(false);
+    }
+  }, []);
+
+  // Component unmount cleanup
+  useEffect(() => {
+    return () => {
+      // Force destroy hls instance
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+      // Force kill video element and release resources
+      if (videoRef.current) {
+        videoRef.current.pause();
+        videoRef.current.removeAttribute('src');
+        videoRef.current.load();
+      }
+    };
+  }, []);
+
+  const handleSeek = (time: number) => {
+    const isGlobal = (globalDuration !== undefined && globalDuration > 0) || timeOffset > 0;
+    const globalTarget = Math.max(0, time);
+    const currentPartDur = duration || 0;
+
+    // Check if seek target crosses into a previous or next episode part
+    const isOutsideCurrentPart = isGlobal && Boolean(onGlobalSeek) && (
+      globalTarget < timeOffset || (currentPartDur > 0 && globalTarget >= timeOffset + currentPartDur)
+    );
+
+    if (isOutsideCurrentPart && onGlobalSeek) {
+      onGlobalSeek(globalTarget);
+      return;
+    }
+
+    const localTarget = Math.max(0, isGlobal ? globalTarget - timeOffset : globalTarget);
+
+    if (videoRef.current) {
+      try {
+        videoRef.current.currentTime = localTarget;
+      } catch (e) {
+        console.warn('Seek error:', e);
+      }
+      setCurrentTime(localTarget);
+      targetSeekTimeRef.current = 0;
+      isInitialSeekDoneRef.current = true;
+    }
+
+    if (onGlobalSeek) {
+      onGlobalSeek(globalTarget);
+    }
+  };
+
+  const handleFullscreen = async () => {
+    const container = playerContainerRef.current;
+    if (!container) return;
+
+    const isCurrentlyFs = !!(
+      document.fullscreenElement ||
+      (document as any).webkitFullscreenElement ||
+      (document as any).mozFullScreenElement ||
+      (document as any).msFullscreenElement
+    );
+
+    if (!isCurrentlyFs) {
+      try {
+        if (container.requestFullscreen) {
+          await container.requestFullscreen();
+        } else if ((container as any).webkitRequestFullscreen) {
+          await (container as any).webkitRequestFullscreen();
+        } else if ((container as any).mozRequestFullScreen) {
+          await (container as any).mozRequestFullScreen();
+        } else if ((container as any).msRequestFullscreen) {
+          await (container as any).msRequestFullscreen();
+        } else {
+          // Fallback to CSS fullscreen overlay keeping custom controls
+          setIsFullscreen(true);
+        }
+
+        NativeBridgeService.setNativeLandscapeOrientation(true);
+        if (screen.orientation && (screen.orientation as any).lock) {
+          ((screen.orientation as any).lock as any)('landscape').catch(() => {});
+        } else if ((screen as any).lockOrientation) {
+          (screen as any).lockOrientation('landscape');
+        } else if ((screen as any).mozLockOrientation) {
+          (screen as any).mozLockOrientation('landscape');
+        } else if ((screen as any).msLockOrientation) {
+          (screen as any).msLockOrientation('landscape');
+        }
+      } catch (err) {
+        console.error("Fullscreen error", err);
+      }
+    } else {
+      try {
+        if (document.exitFullscreen) {
+          await document.exitFullscreen();
+        } else if ((document as any).webkitExitFullscreen) {
+          await (document as any).webkitExitFullscreen();
+        } else if ((document as any).mozCancelFullScreen) {
+          await (document as any).mozCancelFullScreen();
+        } else if ((document as any).msExitFullscreen) {
+          await (document as any).msExitFullscreen();
+        }
+
+        NativeBridgeService.setNativeLandscapeOrientation(false);
+        if (screen.orientation && screen.orientation.unlock) {
+          ((screen.orientation as any).unlock as any)();
+        } else if ((screen as any).unlockOrientation) {
+          (screen as any).unlockOrientation();
+        }
+      } catch (err) {
+        console.error("Exit fullscreen error", err);
+      }
+    }
+  };
+  
+  // Expose fullscreen exit helper for Android hardware back button
+  useEffect(() => {
+    (window as any).__isMaxPlayPlayerFullscreen = isFullscreen;
+    (window as any).__exitMaxPlayPlayerFullscreen = () => {
+      if (isFullscreen) {
+        handleFullscreen();
+        return true;
+      }
+      return false;
+    };
+    return () => {
+      (window as any).__isMaxPlayPlayerFullscreen = false;
+    };
+  }, [isFullscreen]);
+
+  const handlePipToggle = async () => {
+    // Expand ONLY the video player to 100% of the screen BEFORE entering native Android PiP
+    // so the floating PiP window shows ONLY the video player and never the entire Details Screen!
+    if (NativeBridgeService.isRunningInKotlinApp()) {
+      setIsInNativePip(true);
+      setShowControls(false);
+      setActiveMenu(null);
+      requestAnimationFrame(() => {
+        NativeBridgeService.enterNativePipMode();
+      });
+      return;
+    }
+    try {
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+      } else if (videoRef.current && document.pictureInPictureEnabled) {
+        await videoRef.current.requestPictureInPicture();
+      }
+    } catch (e) {
+      console.error("PiP error", e);
+    }
+  };
+
+  const changePlaybackRate = (rate: number) => {
+    setPlaybackRate(rate);
+    if (videoRef.current) {
+      videoRef.current.playbackRate = rate;
+    }
+    setActiveMenu(null);
+    handleControlInteraction();
+  };
+  
+  const changeLanguage = (lang: string) => {
+    if (videoRef.current && videoRef.current.currentTime > 0.5) {
+      savedSwitchTimeRef.current = videoRef.current.currentTime;
+    }
+    if ((videoRef.current && !videoRef.current.paused) || isPlaying || hasStarted) {
+      wasPlayingBeforeSwitchRef.current = true;
+    }
+
+    setCurrentLanguage(lang);
+    if (onLanguageChange) onLanguageChange(lang);
+
+    // 1. If HLS stream has internal audio tracks, switch audio track immediately with buffer flush
+    if (hlsRef.current && isHlsStreamRef.current && hlsAudioTracks.length > 0) {
+      let trackIdx = hlsAudioTracks.findIndex((t) =>
+        ClientHlsDownloader.matchesTargetLanguage(
+          { name: (t as any).rawName || t.name, language: t.lang || '', friendly: t.name },
+          lang
+        )
+      );
+
+      if (trackIdx === -1) {
+        const matchNum = lang.match(/(\d+)/);
+        if (matchNum) {
+          const idx = parseInt(matchNum[1], 10) - 1;
+          if (idx >= 0 && idx < hlsAudioTracks.length) {
+            trackIdx = idx;
+          }
+        }
+      }
+
+      if (trackIdx !== -1) {
+        performInstantHlsAudioSwitch(hlsRef.current, trackIdx, lang, true);
+      } else if (onRequestCrossServerLanguageSwitch) {
+        const hasDirectLangSource =
+          videoSources &&
+          typeof videoSources === 'object' &&
+          Object.keys(videoSources).some(
+            (k) =>
+              k.toLowerCase().trim() === lang.toLowerCase().trim() ||
+              ClientHlsDownloader.matchesTargetLanguage({ name: k, language: k, friendly: k }, lang)
+          );
+        if (!hasDirectLangSource) {
+          lastCrossServerLangReqRef.current = `${selectedServer}:${lang.toLowerCase().trim()}`;
+          onRequestCrossServerLanguageSwitch(lang);
+        }
+      }
+    }
+
+    // 2. If HTML5 Video has native audioTracks
+    if (videoRef.current && (videoRef.current as any).audioTracks) {
+      const nativeTracks = (videoRef.current as any).audioTracks;
+      for (let i = 0; i < nativeTracks.length; i++) {
+        const track = nativeTracks[i];
+        const isMatch = ClientHlsDownloader.matchesTargetLanguage(
+          { name: track.label || '', language: track.language || '' },
+          lang
+        );
+        track.enabled = isMatch;
+      }
+    }
+
+    setActiveMenu(null);
+    handleControlInteraction();
+  };
+  
+  const changeQuality = (qual: string) => {
+    // Capture current playback position before switching quality link/level
+    if (videoRef.current && videoRef.current.currentTime > 0.5) {
+      savedSwitchTimeRef.current = videoRef.current.currentTime;
+    }
+    if ((videoRef.current && !videoRef.current.paused) || isPlaying || hasStarted) {
+      wasPlayingBeforeSwitchRef.current = true;
+    }
+
+    const cleanQual = qual.replace(/\s*\[(S1|S2|S3)\]/i, '').trim() || 'auto';
+    const hasInPlaceHlsLevels = Boolean(
+      hlsRef.current &&
+      isHlsStreamRef.current &&
+      hlsRef.current.levels &&
+      hlsRef.current.levels.length > 1 &&
+      !/\[(S1|S2|S3)\]/i.test(qual)
+    );
+    if (!hasInPlaceHlsLevels) {
+      setHasRenderedFirstFrame(false);
+      setIsLoading(true);
+    }
+    triggerQualitySwitchBanner(cleanQual);
+    setCurrentQuality(cleanQual);
+    prevActiveQualityPropRef.current = cleanQual;
+    try {
+      localStorage.setItem('maxplay_preferred_quality', cleanQual);
+    } catch {}
+    if (onQualityChange) onQualityChange(qual);
+
+    // If HLS stream has internal multi-quality levels, switch level seamlessly via currentLevel + loadLevel + nextLevel
+    if (hlsRef.current && isHlsStreamRef.current && hlsRef.current.levels && hlsRef.current.levels.length > 0) {
+      if (cleanQual.toLowerCase() === 'auto') {
+        hlsRef.current.currentLevel = -1;
+        hlsRef.current.loadLevel = -1;
+        hlsRef.current.nextLevel = -1;
+        if (videoRef.current && videoRef.current.readyState >= 2 && !videoRef.current.paused) {
+          setHasRenderedFirstFrame(true);
+          setIsLoading(false);
+        }
+      } else {
+        const levelIdx = findMatchingHlsLevelIndex(hlsRef.current.levels, cleanQual);
+        if (levelIdx !== -1) {
+          hlsRef.current.currentLevel = levelIdx;
+          hlsRef.current.loadLevel = levelIdx;
+          hlsRef.current.nextLevel = levelIdx;
+        }
+      }
+    }
+
+    setActiveMenu(null);
+    handleControlInteraction();
+  };
+
+  const isSkipButtonVisible = Boolean(
+    hasStarted &&
+    activeSkipMarker &&
+    !isLocked &&
+    (showControls || autoShowSkip)
+  );
+
+  const handleSkipIntroOutro = (e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    if (!activeSkipMarker) return;
+    handleSeek(activeSkipMarker.end);
+    setAutoShowSkip(false);
+    if (autoHideSkipTimeoutRef.current) {
+      clearTimeout(autoHideSkipTimeoutRef.current);
+      autoHideSkipTimeoutRef.current = null;
+    }
+    handleControlInteraction();
+  };
+
+  return (
+    <div 
+      ref={playerContainerRef}
+      className={
+        isInNativePip
+          ? "fixed inset-0 z-[99999] w-screen h-screen bg-black overflow-hidden flex items-center justify-center select-none no-callout"
+          : "relative w-full h-full bg-black group overflow-hidden flex items-center justify-center select-none no-callout"
+      }
+      style={{ WebkitTouchCallout: 'none', WebkitUserSelect: 'none', userSelect: 'none' }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+      onClickCapture={() => {
+        adManager.handlePlayerAction(!!user?.isPremium);
+      }}
+      onMouseMove={handleControlInteraction}
+      onTouchMove={handleControlInteraction}
+    >
+      <GestureHandler
+        isLocked={isLocked}
+        onToggleControls={toggleControls}
+        onChangeBrightness={handleBrightnessChange}
+        onChangeVolume={handleVolumeChange}
+        onLongPressStart={handleLongPressStart}
+        onLongPressMove={handleLongPressMove}
+        onLongPressEnd={handleLongPressEnd}
+        onDoubleTapCenter={() => {
+          setShowControls(false);
+          handlePlayPause();
+        }}
+        onDoubleTapRewind={() => {
+          const currentGlobal = timeOffset + currentTime;
+          const targetGlobal = Math.max(0, currentGlobal - 10);
+          handleSeek(targetGlobal);
+          handleControlInteraction();
+        }}
+        onDoubleTapForward={() => {
+          const currentGlobal = timeOffset + currentTime;
+          const maxDur = (globalDuration !== undefined && globalDuration > 0) ? globalDuration : (duration || 999999);
+          const targetGlobal = Math.min(maxDur, currentGlobal + 10);
+          handleSeek(targetGlobal);
+          handleControlInteraction();
+        }}
+      >
+        
+        {isIframe ? (
+          <iframe 
+            src={iframeUrl} 
+            className="absolute inset-0 w-full h-full border-0 pointer-events-auto"
+            allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+            allowFullScreen
+          />
+        ) : (
+          <video 
+            referrerPolicy="no-referrer"
+            ref={videoRef}
+            playsInline
+            className={`absolute inset-0 w-full h-full pointer-events-none will-change-transform ${
+              isFullscreen && videoStretchMode === 'fill'
+                ? 'object-fill'
+                : isFullscreen && videoStretchMode === 'cover'
+                ? 'object-cover'
+                : 'object-contain'
+            }`}
+            style={{ filter: brightness === 100 ? undefined : `brightness(${brightness}%)`, transform: 'translateZ(0)' }}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+          onPlay={() => { 
+            // Pause any other video elements in the DOM AND notify Music Player so video & music never play simultaneously
+            try {
+              window.dispatchEvent(new CustomEvent('MAXPLAY_VIDEO_PLAYING'));
+              document.querySelectorAll('video').forEach((v) => {
+                if (v !== videoRef.current && !v.paused) {
+                  v.pause();
+                }
+              });
+            } catch {}
+            setIsPlaying(true); 
+            setHasStarted(true); 
+            setIsLoading(false);
+            if (!isInitialSeekDoneRef.current && targetSeekTimeRef.current > 0 && videoRef.current) {
+              if (Math.abs(videoRef.current.currentTime - targetSeekTimeRef.current) > 2) {
+                try {
+                  videoRef.current.currentTime = targetSeekTimeRef.current;
+                } catch (e) {
+                  console.warn('Seek on play error:', e);
+                }
+              }
+            }
+            isInitialSeekDoneRef.current = true;
+            targetSeekTimeRef.current = 0;
+          }}
+          onPause={() => {
+            setIsPlaying(false);
+            const t = videoRef.current?.currentTime ?? currentTime;
+            const d = videoRef.current?.duration || duration || 0;
+            if (targetSeekTimeRef.current > 2 && t < 1 && !isInitialSeekDoneRef.current) {
+              return;
+            }
+            if (!isSwitchingSourceRef.current) {
+              onPause?.(t, d);
+            }
+          }}
+          onTimeUpdate={(e) => {
+            const t = e.currentTarget.currentTime;
+            const d = e.currentTarget.duration || duration || 0;
+            if (t > 0.05 && !hasRenderedFirstFrame) {
+              setHasRenderedFirstFrame(true);
+            }
+            const now = Date.now();
+            // Zero-Lag Playback Optimization: Only trigger React state updates when controls are visible or skip markers exist
+            if ((showControls || normalizedSkipMarkers) && now - lastTimeStateUpdateRef.current >= 250) {
+              lastTimeStateUpdateRef.current = now;
+              setCurrentTime(t);
+            }
+            // Reset decode error counter once video is playing smoothly
+            if (decodeErrorRetryCountRef.current > 0 && !e.currentTarget.paused && t > 0.5) {
+              decodeErrorRetryCountRef.current = 0;
+            }
+            // If a local video reaches within 0.45s of the very end and stalls/pauses due to trailing audio frame truncation, complete cleanly
+            if (
+              d > 5 &&
+              t >= d - 0.45 &&
+              (activeVideoUrl.includes('/device-video/') || activeVideoUrl.includes('/vault-video/') || activeVideoUrl.startsWith('blob:'))
+            ) {
+              setIsLoading(false);
+            }
+            // Ignore time updates during initial seek phase if time is near 0 but target was > 2
+            if (targetSeekTimeRef.current > 2 && t < 1 && !isInitialSeekDoneRef.current) {
+              return;
+            }
+            if (!isSwitchingSourceRef.current && (now - lastProgressEmitRef.current >= 1500)) {
+              lastProgressEmitRef.current = now;
+              onProgress?.(t, false, d);
+            }
+          }}
+          onLoadedMetadata={(e) => {
+            const d = e.currentTarget.duration || 0;
+            setDuration(d);
+            onDuration?.(d);
+          }}
+          onWaiting={() => setIsLoading(true)}
+          onPlaying={() => {
+            setIsLoading(false);
+            setHasRenderedFirstFrame(true);
+          }}
+          onEnded={() => {
+            setIsPlaying(false);
+            setIsLoading(false);
+            setShowControls(true);
+            const d = videoRef.current?.duration || duration || 0;
+            onProgress?.(currentTime, true, d);
+            onPause?.(currentTime, d);
+            onComplete?.();
+          }}
+          onError={(e: any) => {
+            const videoEl = e.currentTarget as HTMLVideoElement | null;
+            const err = videoEl?.error;
+            const errMsg = err?.message || '';
+            const isDecodeError = Boolean(
+              err && (err.code === 3 || errMsg.includes('PIPELINE_ERROR_DECODE'))
+            );
+            const isAudioPacketError = errMsg.toLowerCase().includes('audio packet');
+
+            if (isDecodeError && videoEl) {
+              const tsMatch = errMsg.match(/timestamp=(\d+)/);
+              const packetSec = tsMatch ? parseInt(tsMatch[1], 10) / 1_000_000 : 0;
+              const vidDur = videoEl.duration || duration || 0;
+              const actualPos =
+                targetSeekTimeRef.current > 0
+                  ? targetSeekTimeRef.current
+                  : packetSec > 0
+                  ? packetSec
+                  : videoEl.currentTime || currentTime || 0;
+
+              // 1. If decode error happens at the very end of the video (trailing truncated audio/video packet),
+              // finish the video cleanly instead of throwing an error or looping!
+              if (vidDur > 4 && (actualPos >= vidDur - 3.2 || packetSec >= vidDur - 3.2)) {
+                console.warn('[InlinePlayer] Trailing packet decode glitch near EOF; completing playback cleanly.');
+                setPlaybackError(null);
+                setIsLoading(false);
+                setIsPlaying(false);
+                setShowControls(true);
+                onProgress?.(vidDur, true, vidDur);
+                onPause?.(vidDur, vidDur);
+                onComplete?.();
+                return;
+              }
+
+              // 2. Auto-recover from seek/drag audio or video packet decode errors (up to 6 retries)
+              if (decodeErrorRetryCountRef.current < 6) {
+                decodeErrorRetryCountRef.current += 1;
+                const retryNum = decodeErrorRetryCountRef.current;
+                // Advance past the damaged GOP/packet (1.2s per retry) so demuxer lands on the next clean keyframe
+                const rawSkipSec = actualPos + 1.2 * retryNum;
+                const safeSkipSec =
+                  vidDur > 3 ? Math.min(vidDur - 1.0, Math.max(0.2, rawSkipSec)) : Math.max(0.2, rawSkipSec);
+
+                console.warn(
+                  `[InlinePlayer] Auto-recovering from Decode Error (#${retryNum}, audio=${isAudioPacketError}) at ${actualPos.toFixed(2)}s -> ${safeSkipSec.toFixed(2)}s`
+                );
+
+                setPlaybackError(null);
+                setIsLoading(true);
+                targetSeekTimeRef.current = safeSkipSec;
+                isInitialSeekDoneRef.current = false;
+
+                try {
+                  document.querySelectorAll('video').forEach((v) => {
+                    if (v !== videoEl) {
+                      try {
+                        v.pause();
+                        v.removeAttribute('src');
+                        v.load();
+                      } catch {}
+                    }
+                  });
+                } catch {}
+
+                setTimeout(() => {
+                  const v = videoRef.current;
+                  if (!v) return;
+                  try {
+                    // If audio packet decoding repeatedly fails on a corrupt local audio track (retry >= 3),
+                    // disable broken audio tracks or mute to prevent FFmpegAudioDecoder from aborting video pipeline
+                    if (isAudioPacketError && retryNum >= 3) {
+                      try {
+                        const aTracks = (v as any).audioTracks;
+                        if (aTracks && aTracks.length > 0) {
+                          for (let i = 0; i < aTracks.length; i++) {
+                            aTracks[i].enabled = false;
+                          }
+                        }
+                      } catch {}
+                    }
+
+                    const cleanBase = (resolvedStreamUrl || activeVideoUrl)
+                      .split('&_dec_retry=')[0]
+                      .split('?_dec_retry=')[0];
+                    const sep = cleanBase.includes('?') ? '&' : '?';
+                    v.src = cleanBase.startsWith('blob:')
+                      ? cleanBase
+                      : `${cleanBase}${sep}_dec_retry=${retryNum}_${Date.now()}`;
+                    v.load();
+
+                    const onLoadedMeta = () => {
+                      v.removeEventListener('loadedmetadata', onLoadedMeta);
+                      try {
+                        if (safeSkipSec > 0 && (!v.duration || safeSkipSec < v.duration - 0.4)) {
+                          v.currentTime = safeSkipSec;
+                        }
+                      } catch {}
+                      v.play()
+                        .then(() => {
+                          setIsPlaying(true);
+                          setHasStarted(true);
+                          setIsLoading(false);
+                          targetSeekTimeRef.current = 0;
+                        })
+                        .catch(() => {
+                          setIsLoading(false);
+                        });
+                    };
+                    v.addEventListener('loadedmetadata', onLoadedMeta);
+                  } catch {}
+                }, 80);
+                return;
+              }
+            }
+
+            // Auto-refresh expired IP-bound / temporary direct stream links (e.g. Server 3 Streamtape 403/410)
+            if (
+              !isDecodeError &&
+              err &&
+              (err.code === 2 || err.code === 4) &&
+              activeVideoUrl &&
+              SmartStreamService.isExtractableSource(activeVideoUrl, isSmartHls) &&
+              !streamRetryAttemptedRef.current
+            ) {
+              streamRetryAttemptedRef.current = true;
+              const resumeAt = Math.max(
+                videoEl?.currentTime || 0,
+                currentTime || 0,
+                targetSeekTimeRef.current || 0,
+                savedSwitchTimeRef.current || 0
+              );
+              if (resumeAt > 0.5) {
+                savedSwitchTimeRef.current = resumeAt;
+                targetSeekTimeRef.current = resumeAt;
+                isInitialSeekDoneRef.current = false;
+              }
+              wasPlayingBeforeSwitchRef.current = true;
+              setPlaybackError(null);
+              setIsLoading(true);
+              setIsResolvingStream(true);
+              SmartStreamService.clearClientCache(activeVideoUrl);
+              SmartStreamService.resolveStream(activeVideoUrl, { forceRefresh: true })
+                .then((fresh) => {
+                  if (fresh && fresh.streamUrl && !fresh.isEmbed) {
+                    setEmbedFallbackUrl('');
+                    if (fresh.streamUrl === resolvedStreamUrl && videoRef.current) {
+                      videoRef.current.load();
+                    } else {
+                      setResolvedStreamUrl(fresh.streamUrl);
+                    }
+                  } else if (fresh && fresh.isEmbed && fresh.streamUrl) {
+                    setEmbedFallbackUrl(fresh.streamUrl);
+                    setResolvedStreamUrl('');
+                  } else {
+                    setPlaybackError('Stream link expired. Please tap Retry.');
+                  }
+                })
+                .catch((refreshErr) => {
+                  console.warn('[InlinePlayer] Stream auto-refresh failed:', refreshErr);
+                  setPlaybackError('Failed to refresh expired stream. Please tap Retry.');
+                })
+                .finally(() => {
+                  setIsResolvingStream(false);
+                  setIsLoading(false);
+                });
+              return;
+            }
+
+            setIsLoading(false);
+            let msg = "Unknown Error";
+            if (err) {
+              switch (err.code) {
+                case 1: msg = "Aborted"; break;
+                case 2: msg = "Network Error"; break;
+                case 3: msg = "Decode Error"; break;
+                case 4: msg = "Format Not Supported / URL Expired"; break;
+                default: msg = "Code " + err.code;
+              }
+              if (err.message) msg += " (" + err.message + ")";
+            }
+            console.error("Video Error Details:", err ? err.code : "null", "URL:", activeVideoUrl);
+            setPlaybackError('Failed to load video: ' + msg);
+          }}
+        />
+        )}
+
+        {/* Horizontal Poster Backdrop: Remains visible while stream resolves/loads until the first video frame renders */}
+        {!isIframe && !hasRenderedFirstFrame && posterUrl && (
+          <div
+            className="absolute inset-0 z-10 bg-black bg-cover bg-center pointer-events-none transition-opacity duration-300"
+            style={{ backgroundImage: `url(${posterUrl})` }}
+          >
+            <div className="absolute inset-0 bg-black/35" />
+          </div>
+        )}
+
+        {!isIframe && !hasStarted && !isPlaying && activeVideoUrl && (
+          <div 
+            onClick={() => {
+              handlePlayPause();
+              handleControlInteraction();
+            }}
+            className="absolute inset-0 z-20 flex items-center justify-center bg-black/60 bg-cover bg-center cursor-pointer transition-all duration-300 pointer-events-auto"
+            style={{ backgroundImage: posterUrl ? `url(${posterUrl})` : undefined }}
+          >
+            <div className="absolute inset-0 bg-black/40" />
+            <div className="relative z-30 flex items-center justify-center w-18 h-18 sm:w-20 sm:h-20 bg-[#8B5CF6] rounded-full hover:scale-110 active:scale-95 transition-transform shadow-lg shadow-purple-600/30">
+              <Play className="w-9 h-9 sm:w-10 sm:h-10 fill-white translate-x-0.5" />
+            </div>
+          </div>
+        )}
+
+        {!isIframe && (isLoading || isResolvingStream || Boolean(switchingQualityLabel)) && !isInNativePip && (
+          <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/45 pointer-events-none gap-2.5">
+            <Loader2 className="w-12 h-12 text-[#8B5CF6] animate-spin" />
+            {switchingQualityLabel ? (
+              <span className="text-xs sm:text-sm font-bold text-white tracking-wide bg-black/85 px-4 py-1.5 rounded-full border border-[#8B5CF6]/50 shadow-xl animate-pulse">
+                Your quality is switching to {switchingQualityLabel}...
+              </span>
+            ) : isResolvingStream ? (
+              <span className="text-xs font-medium text-white/80 tracking-wide bg-black/75 px-3 py-1 rounded-full border border-white/10">
+                {selectedServer === 'server3' ? 'Connecting to Server 3...' : 'Securing stream link...'}
+              </span>
+            ) : null}
+          </div>
+        )}
+
+        {qualitySwitchDoneBadge && !switchingQualityLabel && !isInNativePip && (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-40 pointer-events-none animate-in fade-in zoom-in-95 duration-200">
+            <div className="bg-emerald-600/95 text-white text-[11px] font-bold px-3.5 py-1 rounded-full border border-emerald-300/40 shadow-lg">
+              ✓ {qualitySwitchDoneBadge}
+            </div>
+          </div>
+        )}
+
+        {!isIframe && (playbackError || !activeVideoUrl) && (
+          <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-black/90 p-6 text-center text-white pointer-events-auto">
+            <AlertTriangle className="w-10 h-10 text-amber-500 mb-3" />
+            <p className="font-semibold text-lg mb-2">{playbackError || 'No Video Stream Available'}</p>
+            <div className="flex flex-wrap items-center justify-center gap-3">
+              <button onClick={() => { setPlaybackError(null); handlePlayPause(); handleControlInteraction(); }} className="px-4 py-2 bg-white/10 hover:bg-white/20 rounded-lg text-sm font-medium transition active:scale-95 cursor-pointer">Retry</button>
+              {activeVideoUrl && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const fallback = SmartStreamService.getEmbedUrl(activeVideoUrl) || activeVideoUrl;
+                    setEmbedFallbackUrl(fallback);
+                    setResolvedStreamUrl('');
+                    setPlaybackError(null);
+                  }}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-sm font-medium transition active:scale-95 cursor-pointer text-center flex items-center shadow-lg shadow-emerald-900/30"
+                >
+                  Play in Web Player
+                </button>
+              )}
+              {activeVideoUrl && (
+                <a href={activeVideoUrl} target="_blank" rel="noopener noreferrer" className="px-4 py-2 bg-[#8B5CF6] hover:bg-[#7C3AED] rounded-lg text-sm font-medium transition active:scale-95 cursor-pointer text-center flex items-center">
+                  Open Externally
+                </a>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Dedicated Top-Left Exit Button when PlayerControls are not visible (unstarted, controls hidden in portrait, error, or iframe) */}
+        {onBack && !isInNativePip && !isLocked && (!hasStarted || (!showControls && !isFullscreen) || playbackError || isIframe) && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onBack();
+            }}
+            onMouseDown={(e) => {
+              e.stopPropagation();
+            }}
+            onTouchStart={(e) => {
+              e.stopPropagation();
+            }}
+            onTouchEnd={(e) => {
+              e.stopPropagation();
+            }}
+            className="absolute top-3 left-3 sm:top-4 sm:left-4 z-40 flex h-9 w-9 sm:h-10 sm:w-10 items-center justify-center rounded-full bg-black/85 hover:bg-black text-white border border-white/35 hover:border-white/70 shadow-2xl cursor-pointer pointer-events-auto transition-transform hover:scale-105 active:scale-90"
+            title="Exit details screen"
+            aria-label="Go Back"
+          >
+            <ArrowLeft className="h-5 w-5 sm:h-6 sm:w-6 stroke-[2.5]" />
+          </button>
+        )}
+
+        {/* CRUNCHYROLL / NETFLIX SINGLE UNIFIED SKIP INTRO / OUTRO BUTTON */}
+        {isSkipButtonVisible && activeSkipMarker && (
+          <div className="absolute right-4 sm:right-8 bottom-16 sm:bottom-20 z-40 pointer-events-auto select-none animate-in fade-in zoom-in-95 duration-200">
+            <button
+              type="button"
+              onClick={handleSkipIntroOutro}
+              className="bg-black/90 hover:bg-[#8B5CF6] text-white px-4 py-2 sm:px-5 sm:py-2.5 rounded-xl font-bold text-xs sm:text-sm border border-white/30 hover:border-purple-300 shadow-2xl hover:scale-105 active:scale-95 transition-all flex items-center gap-2 cursor-pointer group shadow-purple-950/40"
+            >
+              <SkipForward className="h-4 w-4 text-[#8B5CF6] group-hover:text-white transition-colors" />
+              <span className="tracking-wide">{activeSkipMarker.label}</span>
+            </button>
+          </div>
+        )}
+
+        {/* PlayIt-Style Long-Press Speed Capsule HUD */}
+        <SpeedCapsuleHUD 
+          visible={isFastForwarding} 
+          speed={capsuleSpeed} 
+          progress={capsuleProgress}
+          minimized={isCapsuleMinimized}
+        />
+
+        {/* Brightness Indicator HUD */}
+        <div 
+          className={`absolute left-4 sm:left-6 top-1/2 -translate-y-1/2 z-40 transition-all duration-200 pointer-events-none ${
+            showBrightnessIndicator 
+              ? 'opacity-100 scale-100 translate-x-0' 
+              : 'opacity-0 scale-95 -translate-x-2'
+          }`}
+        >
+          <div className="bg-black/90 border border-white/20 rounded-2xl px-3 py-4 flex flex-col items-center gap-2.5 shadow-[0_8px_32px_rgba(0,0,0,0.6)] min-w-[56px]">
+            <div className="p-1.5 rounded-full bg-amber-500/20 text-amber-300">
+              {brightness > 100 ? (
+                <Sun className="w-5 h-5 animate-pulse text-amber-300" />
+              ) : (
+                <SunMedium className="w-5 h-5 text-amber-300" />
+              )}
+            </div>
+            <div className="w-2 sm:w-2.5 h-28 bg-white/15 rounded-full overflow-hidden flex flex-col-reverse p-0.5 shadow-inner">
+              <div 
+                className="w-full bg-gradient-to-t from-amber-400 via-amber-300 to-yellow-100 rounded-full transition-all duration-75 shadow-[0_0_10px_rgba(251,191,36,0.7)]" 
+                style={{ height: `${Math.min(100, Math.max(5, (brightness - 10) / 190 * 100))}%` }}
+              />
+            </div>
+            <span className="font-mono text-xs font-bold text-white tracking-wider tabular-nums">
+              {brightness}%
+            </span>
+            <span className="text-[9px] uppercase font-semibold tracking-widest text-white/50 -mt-1">
+              Light
+            </span>
+          </div>
+        </div>
+
+        {/* Volume Indicator HUD */}
+        <div 
+          className={`absolute right-4 sm:right-6 top-1/2 -translate-y-1/2 z-40 transition-all duration-200 pointer-events-none ${
+            showVolumeIndicator 
+              ? 'opacity-100 scale-100 translate-x-0' 
+              : 'opacity-0 scale-95 translate-x-2'
+          }`}
+        >
+          <div className={`border rounded-2xl px-3 py-4 flex flex-col items-center gap-2.5 shadow-[0_8px_32px_rgba(0,0,0,0.6)] min-w-[56px] transition-colors duration-200 ${
+            volume > 100 
+              ? 'bg-black/95 border-orange-500/60 shadow-[0_0_25px_rgba(249,115,22,0.35)]' 
+              : 'bg-black/90 border-white/20'
+          }`}>
+            <div className={`p-1.5 rounded-full transition-colors duration-200 ${
+              volume > 100 
+                ? 'bg-orange-500/25 text-orange-400' 
+                : volume === 0 
+                  ? 'bg-red-500/20 text-red-400' 
+                  : 'bg-cyan-500/20 text-cyan-300'
+            }`}>
+              {volume === 0 ? (
+                <VolumeX className="w-5 h-5" />
+              ) : volume > 100 ? (
+                <Zap className="w-5 h-5 animate-pulse text-orange-400" />
+              ) : volume > 50 ? (
+                <Volume2 className="w-5 h-5 text-cyan-300" />
+              ) : (
+                <Volume1 className="w-5 h-5 text-cyan-300" />
+              )}
+            </div>
+            <div className="w-2 sm:w-2.5 h-28 bg-white/15 rounded-full overflow-hidden flex flex-col-reverse p-0.5 shadow-inner">
+              <div 
+                className={`w-full rounded-full transition-all duration-75 ${
+                  volume > 100 
+                    ? 'bg-gradient-to-t from-amber-500 via-orange-500 to-rose-500 shadow-[0_0_12px_rgba(249,115,22,0.9)]' 
+                    : 'bg-gradient-to-t from-cyan-500 via-blue-400 to-teal-200 shadow-[0_0_10px_rgba(6,182,212,0.6)]'
+                }`} 
+                style={{ height: `${Math.min(100, Math.max(volume === 0 ? 0 : 5, volume / 2))}%` }}
+              />
+            </div>
+            <span className={`font-mono text-xs font-bold tracking-wider tabular-nums ${
+              volume > 100 ? 'text-orange-400 drop-shadow-[0_0_6px_rgba(249,115,22,0.8)]' : 'text-white'
+            }`}>
+              {volume}%
+            </span>
+            {volume > 100 ? (
+              <span className="text-[8px] uppercase font-black tracking-widest text-orange-400 bg-orange-500/20 border border-orange-500/40 px-1.5 py-0.5 rounded-full -mt-1 animate-pulse">
+                BOOST
+              </span>
+            ) : (
+              <span className="text-[9px] uppercase font-semibold tracking-widest text-white/50 -mt-1">
+                Vol
+              </span>
+            )}
+          </div>
+        </div>
+
+        {!isIframe && hasStarted && !isInNativePip && (
+          <PlayerControls
+            isVisible={showControls && !activeMenu}
+            isPlaying={isPlaying}
+            currentTime={timeOffset + currentTime}
+            duration={globalDuration !== undefined ? globalDuration : duration}
+            title={title}
+            skipMarkers={normalizedSkipMarkers}
+            isFullscreen={isFullscreen}
+            isLocked={isLocked}
+            onLockChange={setIsLocked}
+            videoStretchMode={videoStretchMode}
+            onToggleStretchMode={() => {
+              setVideoStretchMode((prev) =>
+                prev === 'contain' ? 'fill' : prev === 'fill' ? 'cover' : 'contain'
+              );
+              handleControlInteraction();
+            }}
+            videoElement={videoRef.current}
+            previewStreamUrl={resolvedStreamUrl}
+            posterUrl={posterUrl}
+            timeOffset={timeOffset}
+            currentLanguage={currentLanguage}
+            currentQuality={currentQuality}
+            playbackRate={playbackRate}
+            onPlayPause={() => {
+              handlePlayPause();
+              handleControlInteraction();
+            }}
+            onSeek={(t) => {
+              handleSeek(t);
+              handleControlInteraction();
+            }}
+            onRewind10={() => {
+              const currentGlobal = timeOffset + currentTime;
+              handleSeek(Math.max(0, currentGlobal - 10));
+              handleControlInteraction();
+            }}
+            onForward10={() => {
+              const currentGlobal = timeOffset + currentTime;
+              const maxDur = globalDuration !== undefined ? globalDuration : duration;
+              handleSeek(Math.min(maxDur, currentGlobal + 10));
+              handleControlInteraction();
+            }}
+            onNext={onNext ? () => {
+              onNext();
+              handleControlInteraction();
+            } : undefined}
+            onFullscreenToggle={() => {
+              handleFullscreen();
+              handleControlInteraction();
+            }}
+            onPipToggle={() => {
+              handlePipToggle();
+              handleControlInteraction();
+            }}
+            onSpeedPress={() => {
+              setActiveMenu(prev => prev === 'speed' ? null : 'speed');
+            }}
+            onLanguagePress={availableLanguages.length > 0 ? () => {
+              setActiveMenu(prev => prev === 'language' ? null : 'language');
+            } : undefined}
+            onQualityPress={availableQualities.length > 0 ? () => {
+              setActiveMenu(prev => prev === 'quality' ? null : 'quality');
+            } : undefined}
+            onBack={isFullscreen ? () => {
+              handleFullscreen();
+              handleControlInteraction();
+            } : onBack}
+            onScrubStart={() => {
+              if (controlsTimeoutRef.current) {
+                clearTimeout(controlsTimeoutRef.current);
+                controlsTimeoutRef.current = null;
+              }
+            }}
+            onScrubEnd={() => {
+              handleControlInteraction();
+            }}
+          />
+        )}
+
+        {/* SLEEK RIGHT-SIDE SLIDE-OVER DRAWERS */}
+        <SpeedDrawer
+          visible={activeMenu === 'speed'}
+          currentSpeed={playbackRate}
+          onSelectSpeed={changePlaybackRate}
+          onClose={() => setActiveMenu(null)}
+        />
+
+        <QualityDrawer
+          visible={activeMenu === 'quality'}
+          currentQuality={currentQuality}
+          availableQualities={availableQualities.filter(q => q !== 'auto')}
+          isAutoMode={currentQuality === 'auto'}
+          actualQuality={actualQuality}
+          onSelectQuality={changeQuality}
+          onClose={() => setActiveMenu(null)}
+        />
+
+        <AudioLangDrawer
+          visible={activeMenu === 'language'}
+          currentLanguage={currentLanguage}
+          availableLanguages={availableLanguages}
+          onSelectLanguage={changeLanguage}
+          onClose={() => setActiveMenu(null)}
+        />
+      </GestureHandler>
+    </div>
+  );
+};
+

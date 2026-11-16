@@ -1,0 +1,2387 @@
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import {
+  Download,
+  Share2,
+  X,
+  RefreshCw,
+  Check,
+  Sparkles,
+  HardDrive,
+  Upload,
+  FolderOpen,
+  FileDown,
+  Send,
+  Film,
+  Loader2,
+  Smartphone,
+  Wifi,
+  Play,
+  Copy,
+  CheckCircle2,
+  ArrowLeft,
+  Trash2,
+  Tv,
+  Music2,
+} from 'lucide-react';
+import {
+  doc,
+  setDoc,
+  getDoc,
+  onSnapshot,
+  collection,
+  getDocs,
+  deleteDoc,
+} from 'firebase/firestore';
+import { db } from '../../services/firebase';
+import { downloadManager, DownloadTask, DownloadedFile } from '../../services/DownloadManager';
+import { ClientHlsDownloader } from '../../services/clientHlsDownloader';
+import { SmartStreamService } from '../../services/smartStreamService';
+import { DownloadItem } from '../../components/downloads/DownloadItem';
+import { DownloadedItem } from '../../components/downloads/DownloadedItem';
+import { SeriesFolderCard } from '../../components/downloads/SeriesFolderCard';
+import { OfflineDetailScreen } from '../content/OfflineDetailScreen';
+import { ContentCard } from '../../components/common/ContentCard';
+import { NativeBanner } from '../../components/ads/NativeBanner';
+import { NativeBridgeService, DeviceLocalVideoItem } from '../../services/nativeBridgeService';
+import { useContent } from '../../hooks/useContent';
+
+interface DownloadsScreenProps {
+  onPlayContent?: (contentId: string) => void;
+  onDetailOpenChange?: (isOpen: boolean) => void;
+}
+
+interface DirectTransferSession {
+  code: string;
+  senderIp?: string;
+  senderPort?: number;
+  contentId?: string;
+  episodeId?: string;
+  seasonIndex?: number;
+  episodeIndex?: number;
+  title: string;
+  subtitle?: string;
+  posterUrl?: string;
+  quality?: string;
+  language?: string;
+  fileSizeMb: number;
+  storageKey: string;
+  videoUrl?: string;
+  secondaryVideoUrl?: string;
+  batchItems?: Array<{
+    contentId?: string;
+    episodeId?: string;
+    seasonIndex?: number;
+    episodeIndex?: number;
+    title: string;
+    subtitle?: string;
+    posterUrl?: string;
+    quality?: string;
+    language?: string;
+    fileSizeMb: number;
+    storageKey: string;
+    videoUrl?: string;
+    secondaryVideoUrl?: string;
+    isLocalPhoneVideo?: boolean;
+  }>;
+  isLocalPhoneVideo?: boolean;
+  status: 'waiting' | 'transferring' | 'completed';
+  progress?: number;
+  createdAt: number;
+}
+
+export const DownloadsScreen: React.FC<DownloadsScreenProps> = ({
+  onPlayContent,
+  onDetailOpenChange,
+}) => {
+  const { contentList } = useContent();
+  const [tasks, setTasks] = useState<DownloadTask[]>([]);
+  const [completedFiles, setCompletedFiles] = useState<DownloadedFile[]>([]);
+  const [deviceScannedVideos, setDeviceScannedVideos] = useState<DeviceLocalVideoItem[]>([]);
+  const [isScanningLocalVideos, setIsScanningLocalVideos] = useState(false);
+
+  const [activeFilter, setActiveFilter] = useState<'moviebox' | 'local' | 'received'>('moviebox');
+  const [showLocalFoldersView, setShowLocalFoldersView] = useState(false);
+  const [selectedLocalFolder, setSelectedLocalFolder] = useState<string | null>(null);
+  const swipeTouchStartRef = useRef<{ x: number; y: number } | null>(null);
+  const [showTransferModal, setShowTransferModal] = useState(false);
+  const [transferTab, setTransferTab] = useState<'send' | 'receive'>('send');
+  const [sendSourceFilter, setSendSourceFilter] = useState<'maxbox' | 'local'>('maxbox');
+  const [selectedSendFileId, setSelectedSendFileId] = useState<string | null>(null);
+  const [selectedSendFileIds, setSelectedSendFileIds] = useState<string[]>([]);
+  const [activeSeriesFolderPage, setActiveSeriesFolderPage] = useState<{
+    seriesTitle: string;
+    posterUrl: string;
+    episodes: DownloadedFile[];
+  } | null>(null);
+
+  // Direct App-to-App Transfer States
+  const [activeSendSession, setActiveSendSession] = useState<DirectTransferSession | null>(null);
+  const [receiveCodeInput, setReceiveCodeInput] = useState('');
+  const [nearbySessions, setNearbySessions] = useState<DirectTransferSession[]>([]);
+  const [isSearchingSessions, setIsSearchingSessions] = useState(false);
+
+  const [transferStatus, setTransferStatus] = useState<{
+    active: boolean;
+    mode: 'send' | 'receive' | 'local';
+    progress: number;
+    message: string;
+  } | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [refreshSeed, setRefreshSeed] = useState<number>(() => {
+    try {
+      const saved = parseInt(sessionStorage.getItem('maxplay_dl_rec_seed') || '1', 10);
+      return isNaN(saved) || saved < 1 ? 1 : saved;
+    } catch {
+      return 1;
+    }
+  });
+  const [toastMsg, setToastMsg] = useState<string | null>(null);
+  const [storageInfo, setStorageInfo] = useState<{
+    totalGb: number;
+    freeGb: number;
+    usedByAppMb: number;
+  } | null>(null);
+
+  const receiveInputRef = useRef<HTMLInputElement | null>(null);
+  const localVideoInputRef = useRef<HTMLInputElement | null>(null);
+  const sendSessionUnsubRef = useRef<(() => void) | null>(null);
+  const activeReceiveCodeRef = useRef<string | null>(null);
+  const completedReceiveCodesRef = useRef<Set<string>>(new Set());
+
+  const refreshStorageStats = () => {
+    const nativeStats = NativeBridgeService.getDeviceStorageStats();
+    if (nativeStats && nativeStats.ok) {
+      setStorageInfo({
+        totalGb: nativeStats.totalGb || 64,
+        freeGb: nativeStats.freeGb || 12,
+        usedByAppMb: nativeStats.usedByAppMb || 0,
+      });
+      return;
+    }
+    if (typeof navigator !== 'undefined' && navigator.storage && navigator.storage.estimate) {
+      navigator.storage
+        .estimate()
+        .then((est) => {
+          if (est && typeof est.quota === 'number' && typeof est.usage === 'number') {
+            const totalGb = Math.max(1, Math.round((est.quota / (1024 * 1024 * 1024)) * 10) / 10);
+            const usedByAppMb = Math.round((est.usage / (1024 * 1024)) * 10) / 10;
+            const freeGb = Math.max(
+              0,
+              Math.round(((est.quota - est.usage) / (1024 * 1024 * 1024)) * 10) / 10
+            );
+            setStorageInfo({ totalGb, freeGb, usedByAppMb });
+          }
+        })
+        .catch(() => {});
+    }
+  };
+
+  const triggerToast = (msg: string) => {
+    setToastMsg(msg);
+    setTimeout(() => setToastMsg(null), 3500);
+  };
+
+  // Automatic Phone Storage Video Scanner Pipeline
+  const scanPhoneLocalVideos = useCallback((askPermission = false) => {
+    if (!NativeBridgeService.isRunningInKotlinApp()) return;
+    setIsScanningLocalVideos(true);
+    try {
+      const scanned = NativeBridgeService.scanDeviceLocalVideos(askPermission);
+      setDeviceScannedVideos(scanned);
+    } catch {}
+    setTimeout(() => setIsScanningLocalVideos(false), 250);
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = downloadManager.subscribe((updatedTasks) => {
+      setTasks(updatedTasks);
+      setCompletedFiles(downloadManager.getCompletedFiles());
+      refreshStorageStats();
+    });
+
+    setTasks(downloadManager.getTasks());
+    setCompletedFiles(downloadManager.getCompletedFiles());
+    refreshStorageStats();
+    scanPhoneLocalVideos(false);
+
+    const handlePermissionGranted = () => {
+      scanPhoneLocalVideos(false);
+    };
+    window.addEventListener('MAXPLAY_LOCAL_VIDEOS_PERMISSION_GRANTED', handlePermissionGranted);
+
+    return () => {
+      unsubscribe();
+      window.removeEventListener('MAXPLAY_LOCAL_VIDEOS_PERMISSION_GRANTED', handlePermissionGranted);
+      if (sendSessionUnsubRef.current) {
+        sendSessionUnsubRef.current();
+      }
+      NativeBridgeService.stopDirectTransferServerNative();
+    };
+  }, [scanPhoneLocalVideos]);
+
+  // Defer local video auto-scan off the synchronous tab-switch render path so horizontal swiping stays 60 FPS smooth
+  useEffect(() => {
+    if (activeFilter === 'local' && deviceScannedVideos.length === 0) {
+      const timer = setTimeout(() => {
+        scanPhoneLocalVideos(true);
+      }, 120);
+      return () => clearTimeout(timer);
+    }
+  }, [activeFilter, deviceScannedVideos.length, scanPhoneLocalVideos]);
+
+  // Auto-discover nearby/active Direct Transfer sessions when Receive tab is open
+  const fetchActiveTransferSessions = useCallback(async () => {
+    setIsSearchingSessions(true);
+    try {
+      const snap = await getDocs(collection(db, 'downloads', 'p2p_sessions', 'tasks'));
+      const now = Date.now();
+      const valid: DirectTransferSession[] = [];
+      snap.forEach((d) => {
+        const data = d.data() as DirectTransferSession;
+        if (data && data.code && data.title && now - (data.createdAt || 0) < 20 * 60 * 1000) {
+          valid.push(data);
+        }
+      });
+      valid.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      setNearbySessions(valid.slice(0, 6));
+    } catch {}
+    setIsSearchingSessions(false);
+  }, []);
+
+  useEffect(() => {
+    if (showTransferModal && transferTab === 'receive') {
+      fetchActiveTransferSessions();
+    }
+  }, [showTransferModal, transferTab, fetchActiveTransferSessions]);
+
+  const [offlinePlayingFile, setOfflinePlayingFile] = useState<DownloadedFile | null>(null);
+  const [offlineBlobUrl, setOfflineBlobUrl] = useState<string | null>(null);
+  const [offlinePlayingEpisodes, setOfflinePlayingEpisodes] = useState<DownloadedFile[]>([]);
+
+  // Notify RootNavigator whenever OfflineDetailScreen or SeriesFolderPage is open so the Bottom Navigation Bar hides cleanly
+  useEffect(() => {
+    onDetailOpenChange?.(Boolean(offlinePlayingFile || activeSeriesFolderPage));
+  }, [offlinePlayingFile, activeSeriesFolderPage, onDetailOpenChange]);
+
+  // Register hardware Back button handler for DownloadsScreen sub-views
+  useEffect(() => {
+    (window as any).__handleDownloadsScreenBack = () => {
+      if (offlinePlayingFile) {
+        setOfflinePlayingFile(null);
+        setOfflineBlobUrl(null);
+        setOfflinePlayingEpisodes([]);
+        return true;
+      }
+      if (activeSeriesFolderPage) {
+        setActiveSeriesFolderPage(null);
+        return true;
+      }
+      if (selectedLocalFolder) {
+        setSelectedLocalFolder(null);
+        return true;
+      }
+      if (showLocalFoldersView) {
+        setShowLocalFoldersView(false);
+        return true;
+      }
+      if (showTransferModal) {
+        setShowTransferModal(false);
+        return true;
+      }
+      return false;
+    };
+    return () => {
+      delete (window as any).__handleDownloadsScreenBack;
+    };
+  }, [offlinePlayingFile, activeSeriesFolderPage, selectedLocalFolder, showLocalFoldersView, showTransferModal]);
+
+  const activeDownloadingTasks = tasks.filter(
+    (t) => t.status === 'downloading' || t.status === 'paused' || t.status === 'queued' || t.status === 'failed'
+  );
+
+  // Convert scanned phone storage videos into playable DownloadedFile items for the 'Local files' pipeline
+  const scannedLocalFilesAsDownloaded: DownloadedFile[] = useMemo(() => {
+    const formatDuration = (sec: number) => {
+      if (!sec || sec <= 0) return '';
+      const mins = Math.floor(sec / 60);
+      const remSec = sec % 60;
+      if (mins >= 60) {
+        const hrs = Math.floor(mins / 60);
+        const remMins = mins % 60;
+        return `${hrs}h ${remMins}m`;
+      }
+      return `${mins}m ${remSec}s`;
+    };
+
+    const SUPPORTED_VIDEO_EXT_REGEX = /\.(mp4|mkv|webm|mov|m4v|3gp|avi|ts)$/i;
+    const SUPPORTED_MIME_REGEX = /^video\/(mp4|x-matroska|matroska|webm|quicktime|3gpp|mp2t|avi|x-msvideo)/i;
+
+    return deviceScannedVideos
+      .filter((vid) => {
+        if (!vid || !vid.id || !vid.playbackUrl) return false;
+        if (Number(vid.sizeMb) <= 0.05) return false;
+        if (Number(vid.durationSec) <= 0) return false;
+        const mimeOk = vid.mimeType ? SUPPORTED_MIME_REGEX.test(vid.mimeType) : true;
+        const nameOk = vid.title ? SUPPORTED_VIDEO_EXT_REGEX.test(vid.title) || mimeOk : mimeOk;
+        return nameOk;
+      })
+      .map((vid) => {
+        const durText = formatDuration(vid.durationSec);
+        const isVert = Boolean(
+          vid.isVertical || (vid.height && vid.width && vid.height > vid.width && vid.width > 0)
+        );
+        return {
+          id: `dev_vid_${vid.id}`,
+          contentId: `dev_vid_${vid.id}`,
+          title: vid.title,
+          subtitle: `${vid.folderName || 'Phone Storage'}${durText ? ` • ${durText}` : ''} • ${vid.sizeMb} MB`,
+          posterUrl: vid.thumbnailUrl || `https://maxplay.local/device-video-thumb/${vid.id}`,
+          quality: vid.resolution || 'HD',
+          language: vid.folderName || 'Phone Video',
+          fileSizeMb: vid.sizeMb,
+          status: `${vid.sizeMb} MB • ${vid.folderName || 'Phone Storage'} • ${vid.resolution || 'HD'}`,
+          category: 'local',
+          storageKey: `dev_vid_${vid.id}`,
+          videoUrl: vid.playbackUrl,
+          isVertical: isVert,
+          hasError: false,
+          completedAt: (vid.dateModified || 0) * 1000,
+        };
+      });
+  }, [deviceScannedVideos]);
+
+  const manualLocalFiles = useMemo(
+    () => completedFiles.filter((f) => f.category === 'local'),
+    [completedFiles]
+  );
+
+  const totalLocalFilesCount = manualLocalFiles.length + scannedLocalFilesAsDownloaded.length;
+
+  const allLocalFilesCombined = useMemo(
+    () => [...manualLocalFiles, ...scannedLocalFilesAsDownloaded],
+    [manualLocalFiles, scannedLocalFilesAsDownloaded]
+  );
+
+  // Group all local videos by folder name so the Folders button shows every folder containing videos
+  const localVideoFolders = useMemo(() => {
+    const folderMap = new Map<string, DownloadedFile[]>();
+    allLocalFilesCombined.forEach((file) => {
+      const folderName =
+        (file.language && file.language !== 'Phone Video' && file.language !== 'Default'
+          ? file.language
+          : file.subtitle?.split('•')[0]?.trim()) || 'Phone Storage';
+      if (!folderMap.has(folderName)) {
+        folderMap.set(folderName, []);
+      }
+      folderMap.get(folderName)!.push(file);
+    });
+    return Array.from(folderMap.entries()).map(([folderName, videos]) => {
+      const totalMb = videos.reduce((acc, v) => acc + (Number(v.fileSizeMb) || 0), 0);
+      return {
+        folderName,
+        videos,
+        totalMb,
+        previewPoster: videos[0]?.posterUrl || '',
+      };
+    });
+  }, [allLocalFilesCombined]);
+
+  const filteredCompletedFiles = useMemo(() => {
+    if (activeFilter === 'local') {
+      if (showLocalFoldersView && selectedLocalFolder) {
+        const match = localVideoFolders.find((f) => f.folderName === selectedLocalFolder);
+        return match ? match.videos : allLocalFilesCombined;
+      }
+      return allLocalFilesCombined;
+    }
+    if (activeFilter === 'received') {
+      return completedFiles.filter((f) => f.category === 'received');
+    }
+    return completedFiles.filter((f) => f.category === 'moviebox' || !f.category);
+  }, [
+    activeFilter,
+    completedFiles,
+    allLocalFilesCombined,
+    showLocalFoldersView,
+    selectedLocalFolder,
+    localVideoFolders,
+  ]);
+
+  // Group completed downloads into Series Folders vs Standalone Movies
+  const groupedCompleted = useMemo(() => {
+    const seriesMap = new Map<string, DownloadedFile[]>();
+    const standaloneMovies: DownloadedFile[] = [];
+
+    filteredCompletedFiles.forEach((file) => {
+      if (file.episodeId || file.episodeIndex !== undefined) {
+        const key = file.contentId || file.title;
+        if (!seriesMap.has(key)) {
+          seriesMap.set(key, []);
+        }
+        seriesMap.get(key)!.push(file);
+      } else {
+        standaloneMovies.push(file);
+      }
+    });
+
+    const seriesList = Array.from(seriesMap.entries()).map(([contentId, episodes]) => ({
+      contentId,
+      seriesTitle: episodes[0]?.title || 'Series',
+      posterUrl: episodes[0]?.posterUrl || '',
+      episodes,
+    }));
+
+    return {
+      seriesList,
+      standaloneMovies,
+      totalCount: seriesList.length + standaloneMovies.length,
+    };
+  }, [filteredCompletedFiles]);
+
+  const handlePlayItem = async (file: DownloadedFile, episodesList?: DownloadedFile[]) => {
+    let eps =
+      episodesList && episodesList.length > 0
+        ? episodesList
+        : groupedCompleted.seriesList.find((s) => s.contentId === file.contentId)?.episodes || [file];
+
+    if (file.category === 'local' && (!episodesList || episodesList.length === 0)) {
+      const folderName =
+        (file.language && file.language !== 'Phone Video' && file.language !== 'Default'
+          ? file.language
+          : file.subtitle?.split('•')[0]?.trim()) || 'Phone Storage';
+      const folderMatch = localVideoFolders.find((f) => f.folderName === folderName);
+      if (folderMatch && folderMatch.videos.length > 1) {
+        eps = folderMatch.videos;
+      }
+    }
+
+    setOfflinePlayingFile(file);
+    setOfflinePlayingEpisodes(eps);
+
+    if (file.videoUrl && file.videoUrl.includes('/device-video/')) {
+      setOfflineBlobUrl(file.videoUrl);
+      return;
+    }
+
+    try {
+      const blobUrl = await downloadManager.getOfflineVideoUrl(file.id, file.episodeId, file.episodeIndex);
+      if (blobUrl) {
+        setOfflineBlobUrl(blobUrl);
+      } else if (file.videoUrl) {
+        setOfflineBlobUrl(file.videoUrl);
+      }
+    } catch (e) {
+      console.warn('Could not load offline blob eagerly:', e);
+    }
+  };
+
+  const handlePauseResume = (taskId: string) => {
+    downloadManager.togglePauseResume(taskId);
+  };
+
+  const handleCancel = (taskId: string) => {
+    downloadManager.cancelTask(taskId);
+  };
+
+  const handleDeleteCompleted = (id: string) => {
+    if (id.startsWith('dev_vid_')) {
+      setDeviceScannedVideos((prev) => prev.filter((v) => `dev_vid_${v.id}` !== id));
+      triggerToast('Removed from MaxPlay local list');
+      return;
+    }
+
+    const deletedTarget = completedFiles.find(
+      (f) => f.id === id || f.storageKey === id || f.contentId === id
+    );
+
+    // Immediately clean up Send Direct selection and active session if the deleted file was selected or being shared
+    if (
+      selectedSendFileId === id ||
+      (deletedTarget && selectedSendFileId === deletedTarget.id)
+    ) {
+      setSelectedSendFileId(null);
+    }
+
+    if (
+      activeSendSession &&
+      deletedTarget &&
+      (activeSendSession.storageKey === deletedTarget.storageKey ||
+        activeSendSession.title === deletedTarget.title)
+    ) {
+      if (sendSessionUnsubRef.current) {
+        sendSessionUnsubRef.current();
+        sendSessionUnsubRef.current = null;
+      }
+      NativeBridgeService.stopDirectTransferServerNative();
+      deleteDoc(doc(db, 'downloads', 'p2p_sessions', 'tasks', activeSendSession.code)).catch(
+        () => {}
+      );
+      setActiveSendSession(null);
+      setTransferStatus(null);
+    }
+
+    downloadManager.removeCompletedFile(id);
+    setCompletedFiles(downloadManager.getCompletedFiles());
+    triggerToast('Deleted file removed from Downloads & Transfer list');
+  };
+
+  // Real Recommendations from catalog — strictly excluding sample/mock placeholder items and persisting across tab switches
+  const recommendedContent = useMemo(() => {
+    if (!contentList || contentList.length === 0) return [];
+    const mockIds = new Set([
+      'one-piece-egghead',
+      'naruto-shippuden-classic',
+      'avatar-way-of-water',
+      'dune-part-two',
+      'stranger-things-s5',
+      'breaking-bad-remastered',
+      'solo-leveling-arise',
+    ]);
+    const realItems = contentList.filter(
+      (c) =>
+        !mockIds.has(c.id) &&
+        !(c.posterUrl && c.posterUrl.includes('images.unsplash.com'))
+    );
+    const pool = realItems.length > 0 ? [...realItems] : [...contentList];
+
+    // Deterministic Fisher-Yates shuffle based on persisted refreshSeed (always >= 1)
+    let seed = Math.max(1, refreshSeed) * 9301 + 49297;
+    for (let i = pool.length - 1; i > 0; i--) {
+      seed = (seed * 9301 + 49297) % 233280;
+      const j = Math.floor((seed / 233280) * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    return pool.slice(0, 12);
+  }, [contentList, refreshSeed]);
+
+  const handleRefresh = () => {
+    setIsRefreshing(true);
+    setTimeout(() => {
+      setRefreshSeed((prev) => {
+        const next = prev + 1;
+        try {
+          sessionStorage.setItem('maxplay_dl_rec_seed', String(next));
+        } catch {}
+        return next;
+      });
+      setIsRefreshing(false);
+      triggerToast('Refreshed recommendations with new content!');
+    }, 450);
+  };
+
+  // ============================================================================
+  // DIRECT APP-TO-APP TRANSFER (MaxPlay -> MaxPlay with 6-Digit Code & Live P2P)
+  // ============================================================================
+  const toggleSelectSendFile = (fileId: string) => {
+    setSelectedSendFileIds((prev) =>
+      prev.includes(fileId) ? prev.filter((id) => id !== fileId) : [...prev, fileId]
+    );
+  };
+
+  const resolveFileTransferUrls = (file: DownloadedFile) => {
+    let resolvedVideoUrl = file.videoUrl || '';
+    let resolvedSecondaryUrl = (file as any).secondaryVideoUrl || '';
+    const targetQ = (file.quality || '720p').toLowerCase();
+    if (file.contentId) {
+      const catItem = contentList.find((c) => c.id === file.contentId);
+      if (catItem) {
+        const pickFromQualityDict = (dict?: Record<string, string>) => {
+          if (!dict || typeof dict !== 'object') return '';
+          for (const [k, v] of Object.entries(dict)) {
+            if (k.toLowerCase() === targetQ && typeof v === 'string' && v.trim()) return v.trim();
+          }
+          const first = Object.values(dict).find((v) => typeof v === 'string' && v.trim());
+          return first ? first.trim() : '';
+        };
+
+        const seasonsArr = (catItem as any).seasonsData || (catItem as any).seasons;
+        if (
+          file.episodeIndex !== undefined &&
+          (Array.isArray(seasonsArr) || Array.isArray((catItem as any).episodesList))
+        ) {
+          const sIdx = file.seasonIndex || 0;
+          const ep =
+            (Array.isArray(seasonsArr) && seasonsArr[sIdx]?.episodes?.[file.episodeIndex]) ||
+            (Array.isArray((catItem as any).episodesList) &&
+              (catItem as any).episodesList[file.episodeIndex]);
+          if (ep) {
+            resolvedVideoUrl =
+              pickFromQualityDict(ep.qualityLinks) || ep.videoUrl || resolvedVideoUrl;
+            resolvedSecondaryUrl =
+              pickFromQualityDict(
+                (ep as any).secondaryServerQualityLinks || (ep as any).secondaryQualityLinks
+              ) ||
+              (ep as any).secondaryVideoUrl ||
+              resolvedSecondaryUrl;
+          }
+        } else {
+          resolvedVideoUrl =
+            pickFromQualityDict(catItem.qualityLinks) || catItem.videoUrl || resolvedVideoUrl;
+          resolvedSecondaryUrl =
+            pickFromQualityDict(
+              (catItem as any).secondaryServerQualityLinks || catItem.secondaryQualityLinks
+            ) ||
+            (catItem as any).secondaryVideoUrl ||
+            resolvedSecondaryUrl;
+        }
+      }
+    }
+    return { resolvedVideoUrl, resolvedSecondaryUrl };
+  };
+
+  const handleStartDirectSendSession = async (fileOrFiles: DownloadedFile | DownloadedFile[]) => {
+    try {
+      const requestedList = Array.isArray(fileOrFiles) ? fileOrFiles : [fileOrFiles];
+      const latestCompleted = downloadManager.getCompletedFiles();
+      const allSendablePool = [...latestCompleted, ...scannedLocalFilesAsDownloaded];
+      const validFiles = requestedList.filter((reqFile) =>
+        allSendablePool.some((f) => f.id === reqFile.id && !f.hasError)
+      );
+
+      if (validFiles.length === 0) {
+        setCompletedFiles(latestCompleted);
+        triggerToast('Selected file(s) were deleted or are unavailable to send.');
+        return;
+      }
+
+      if (sendSessionUnsubRef.current) {
+        sendSessionUnsubRef.current();
+        sendSessionUnsubRef.current = null;
+      }
+
+      const primaryFile = validFiles[0];
+      setSelectedSendFileId(primaryFile.id);
+      const code = String(Math.floor(100000 + Math.random() * 900000));
+
+      const batchItems = validFiles.map((f) => {
+        const { resolvedVideoUrl, resolvedSecondaryUrl } = resolveFileTransferUrls(f);
+        const epTag = f.episodeIndex !== undefined ? ` • Ep ${f.episodeIndex + 1}` : '';
+        const isLocalVid = f.category === 'local' || String(f.storageKey || '').startsWith('dev_vid_');
+        return {
+          contentId: f.contentId || '',
+          episodeId: f.episodeId || '',
+          seasonIndex: f.seasonIndex,
+          episodeIndex: f.episodeIndex,
+          title: f.title,
+          subtitle: f.subtitle || (epTag ? `Episode ${(f.episodeIndex || 0) + 1}` : ''),
+          posterUrl: f.posterUrl || '',
+          quality: f.quality || '720p',
+          language: f.language || 'Default',
+          fileSizeMb: Math.max(1, f.fileSizeMb || 50),
+          storageKey: f.storageKey || `dl_${f.id}`,
+          videoUrl: resolvedVideoUrl,
+          secondaryVideoUrl: resolvedSecondaryUrl,
+          isLocalPhoneVideo: isLocalVid,
+        };
+      });
+
+      const totalBatchSizeMb =
+        Math.round(batchItems.reduce((acc, item) => acc + (item.fileSizeMb || 50), 0) * 10) / 10;
+      const sessionDisplayTitle =
+        batchItems.length > 1
+          ? `${primaryFile.title} (+${batchItems.length - 1} more • ${batchItems.length} videos)`
+          : primaryFile.title;
+
+      const metadataPayload = {
+        id: primaryFile.id,
+        storageKey: primaryFile.storageKey || `dl_${primaryFile.contentId || primaryFile.id}`,
+        contentId: primaryFile.contentId || '',
+        title: sessionDisplayTitle,
+        subtitle: primaryFile.subtitle || '',
+        posterUrl: primaryFile.posterUrl || '',
+        quality: primaryFile.quality || '720p',
+        language: primaryFile.language || 'Default',
+        fileSizeMb: totalBatchSizeMb,
+        episodeId: primaryFile.episodeId || '',
+        seasonIndex: primaryFile.seasonIndex ?? 0,
+        episodeIndex: primaryFile.episodeIndex,
+      };
+
+      // Start Native LAN P2P HTTP Server on Sender phone (port 48821) if running in APK
+      let senderIp = '';
+      let senderPort = 48821;
+      const primaryStorageKey =
+        batchItems[0]?.storageKey ||
+        primaryFile.storageKey ||
+        (String(primaryFile.id || '').startsWith('dev_vid_')
+          ? String(primaryFile.id)
+          : `dl_${primaryFile.id}`);
+      if (primaryStorageKey && NativeBridgeService.isRunningInKotlinApp()) {
+        const serverRes = NativeBridgeService.startDirectTransferServerNative(
+          primaryStorageKey,
+          code,
+          metadataPayload
+        );
+        if (serverRes && serverRes.ok) {
+          senderIp = serverRes.ip || '';
+          senderPort = serverRes.port || 48821;
+        }
+      }
+
+      const sessionObj: DirectTransferSession = {
+        code,
+        senderIp,
+        senderPort,
+        contentId: primaryFile.contentId || '',
+        episodeId: primaryFile.episodeId || '',
+        seasonIndex: primaryFile.seasonIndex,
+        episodeIndex: primaryFile.episodeIndex,
+        title: sessionDisplayTitle,
+        subtitle: primaryFile.subtitle || '',
+        posterUrl: primaryFile.posterUrl || '',
+        quality: primaryFile.quality || '720p',
+        language: primaryFile.language || 'Default',
+        fileSizeMb: totalBatchSizeMb,
+        storageKey: batchItems[0].storageKey,
+        videoUrl: batchItems[0].videoUrl,
+        secondaryVideoUrl: batchItems[0].secondaryVideoUrl,
+        batchItems,
+        status: 'waiting',
+        progress: 0,
+        createdAt: Date.now(),
+      };
+
+      setActiveSendSession(sessionObj);
+
+      // Register in Firestore `/downloads/p2p_sessions/tasks/{code}` so the Receiver MaxPlay app connects instantly
+      const sessionRef = doc(db, 'downloads', 'p2p_sessions', 'tasks', code);
+      await setDoc(sessionRef, sessionObj);
+
+      // Listen for live progress updates from the Receiver MaxPlay app so SENDER also sees live % and MB!
+      sendSessionUnsubRef.current = onSnapshot(sessionRef, (snap) => {
+        if (!snap.exists()) return;
+        const data = snap.data() as DirectTransferSession;
+        setActiveSendSession(data);
+        if (data.status === 'transferring') {
+          const pct = Math.min(99, Math.max(1, data.progress || 10));
+          const totalMb = data.fileSizeMb || totalBatchSizeMb || 50;
+          const sentMb = Math.round(((totalMb * pct) / 100) * 10) / 10;
+          setTransferStatus({
+            active: true,
+            mode: 'send',
+            progress: pct,
+            message: `Sending ${batchItems.length > 1 ? `${batchItems.length} videos` : `"${primaryFile.title}"`} (${sentMb} MB / ${totalMb} MB • ${pct}%)`,
+          });
+        } else if (data.status === 'completed') {
+          setTransferStatus({
+            active: true,
+            mode: 'send',
+            progress: 100,
+            message: `100% Sent! ${batchItems.length > 1 ? `All ${batchItems.length} videos` : `"${primaryFile.title}"`} delivered to Receiver MaxPlay.`,
+          });
+          setTimeout(() => {
+            setTransferStatus(null);
+          }, 2200);
+          triggerToast(
+            `100% Sent! Direct Transfer of ${batchItems.length > 1 ? `${batchItems.length} videos` : `"${primaryFile.title}"`} completed!`
+          );
+        }
+      });
+
+      triggerToast(
+        `Direct Transfer ready (${batchItems.length} ${batchItems.length === 1 ? 'video' : 'videos'})! Enter code ${code} on Receiver.`
+      );
+    } catch (err) {
+      console.error('Failed to start direct transfer session:', err);
+      triggerToast('Could not start transfer session. Check connection.');
+    }
+  };
+
+  const handleReceiveDirectBySession = async (session: DirectTransferSession) => {
+    const cleanCode = (session.code || '').trim();
+    if (!cleanCode) return;
+
+    // Prevent concurrent or duplicate receive triggers for the same transfer code
+    if (activeReceiveCodeRef.current === cleanCode || transferStatus?.active) {
+      return;
+    }
+    if (completedReceiveCodesRef.current.has(cleanCode)) {
+      setShowTransferModal(false);
+      setActiveFilter('received');
+      triggerToast(`"${session.title}" is already in your Received tab!`);
+      return;
+    }
+
+    activeReceiveCodeRef.current = cleanCode;
+
+    try {
+      const itemsToReceive =
+        Array.isArray(session.batchItems) && session.batchItems.length > 0
+          ? session.batchItems
+          : [
+              {
+                contentId: session.contentId,
+                episodeId: session.episodeId,
+                seasonIndex: session.seasonIndex,
+                episodeIndex: session.episodeIndex,
+                title: session.title,
+                subtitle: session.subtitle,
+                posterUrl: session.posterUrl,
+                quality: session.quality,
+                language: session.language,
+                fileSizeMb: session.fileSizeMb,
+                storageKey: session.storageKey,
+                videoUrl: session.videoUrl,
+                secondaryVideoUrl: session.secondaryVideoUrl,
+              },
+            ];
+
+      const totalBatchItems = itemsToReceive.length;
+      const sessionRef = doc(db, 'downloads', 'p2p_sessions', 'tasks', cleanCode);
+      try {
+        await setDoc(sessionRef, { ...session, status: 'transferring', progress: 5 }, { merge: true });
+      } catch {}
+
+      let lastFirestoreSyncTime = 0;
+      let lastFirestorePct = 5;
+
+      const syncLiveProgressToSender = (overallPct: number) => {
+        const now = Date.now();
+        if (
+          overallPct >= 98 ||
+          (overallPct - lastFirestorePct >= 3 && now - lastFirestoreSyncTime > 250)
+        ) {
+          lastFirestorePct = overallPct;
+          lastFirestoreSyncTime = now;
+          setDoc(sessionRef, { status: 'transferring', progress: overallPct }, { merge: true }).catch(
+            () => {}
+          );
+        }
+      };
+
+      let receivedCount = 0;
+
+      for (let itemIdx = 0; itemIdx < totalBatchItems; itemIdx++) {
+        const item = itemsToReceive[itemIdx];
+        const batchPrefix = totalBatchItems > 1 ? `[${itemIdx + 1}/${totalBatchItems}] ` : '';
+        const epSuffix = item.episodeIndex !== undefined ? ` Ep ${item.episodeIndex + 1}` : '';
+        const itemLabel = `${item.title}${epSuffix}`;
+
+        const deterministicSuffix = item.contentId
+          ? `${item.contentId}_s${item.seasonIndex ?? 0}_e${item.episodeIndex ?? 0}`
+          : (item.title || `${cleanCode}_${itemIdx}`).toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+        const targetStorageKey = item.storageKey || `dl_recv_${deterministicSuffix}`;
+        const expectedTotalMb = Math.max(1, item.fileSizeMb || 50);
+
+        const toOverallPct = (itemPct: number) => {
+          const base = (itemIdx / totalBatchItems) * 100;
+          const share = (Math.min(100, Math.max(0, itemPct)) / totalBatchItems);
+          return Math.min(99, Math.max(5, Math.round(base + share)));
+        };
+
+        setTransferStatus({
+          active: true,
+          mode: 'receive',
+          progress: toOverallPct(6),
+          message: `${batchPrefix}Connecting for "${itemLabel}"...`,
+        });
+
+        let transferredOk = false;
+        let transferredBytes = expectedTotalMb * 1024 * 1024;
+
+        // Path 1: High-Speed 4-Channel Parallel Phone-to-Phone LAN/Hotspot P2P Stream (Zero Mobile Data!)
+        if (NativeBridgeService.isRunningInKotlinApp()) {
+          for (let lanAttempt = 0; lanAttempt < 5 && !transferredOk; lanAttempt++) {
+            const p2pRes = await NativeBridgeService.receiveDirectTransferFromPeerNative(
+              session.senderIp || '192.168.43.1',
+              session.senderPort || 48821,
+              cleanCode,
+              targetStorageKey,
+              (pct, msg) => {
+                const cleanItemPct = Math.min(99, Math.max(5, Math.round(pct)));
+                const overallPct = toOverallPct(cleanItemPct);
+                const recvMb = Math.round(((expectedTotalMb * cleanItemPct) / 100) * 10) / 10;
+                setTransferStatus({
+                  active: true,
+                  mode: 'receive',
+                  progress: overallPct,
+                  message: msg
+                    ? `${batchPrefix}${msg}`
+                    : `${batchPrefix}Receiving "${itemLabel}" (${recvMb} MB / ${expectedTotalMb} MB • ${cleanItemPct}%)`,
+                });
+                syncLiveProgressToSender(overallPct);
+              }
+            );
+            if (p2pRes && p2pRes.ok) {
+              transferredOk = true;
+              if (p2pRes.totalBytes && p2pRes.totalBytes > 0) {
+                transferredBytes = p2pRes.totalBytes;
+              }
+            } else if (lanAttempt < 4) {
+              await new Promise((r) => setTimeout(r, 250 * (lanAttempt + 1)));
+            }
+          }
+        }
+
+        // Path 2: Instant Local Vault Verification
+        if (!transferredOk) {
+          let hasCompleteNativeVault = false;
+          if (
+            NativeBridgeService.supportsNativeOfflineVault() &&
+            NativeBridgeService.hasOfflineItemNative(targetStorageKey)
+          ) {
+            const cp = NativeBridgeService.getOfflineCheckpointInfoNative(targetStorageKey);
+            const minRequiredBytes = expectedTotalMb * 1024 * 1024 * 0.85;
+            if (cp && cp.exists && cp.totalBytes >= minRequiredBytes) {
+              hasCompleteNativeVault = true;
+              transferredBytes = cp.totalBytes;
+            }
+          }
+          const existingBlob =
+            !hasCompleteNativeVault && !NativeBridgeService.supportsNativeOfflineVault()
+              ? await ClientHlsDownloader.getOfflineBlobUrl(targetStorageKey)
+              : null;
+
+          if (hasCompleteNativeVault || existingBlob) {
+            const steps = [30, 65, 95];
+            for (const stepPct of steps) {
+              const overallPct = toOverallPct(stepPct);
+              const recvMb = Math.round(((expectedTotalMb * stepPct) / 100) * 10) / 10;
+              setTransferStatus({
+                active: true,
+                mode: 'receive',
+                progress: overallPct,
+                message: `${batchPrefix}Receiving "${itemLabel}" at High Speed (${recvMb} MB / ${expectedTotalMb} MB)...`,
+              });
+              syncLiveProgressToSender(overallPct);
+              await new Promise((r) => setTimeout(r, 80));
+            }
+            transferredOk = true;
+          }
+        }
+
+        const isLocalSentVideo = Boolean(
+          (item as any).isLocalPhoneVideo ||
+            session.isLocalPhoneVideo ||
+            String(item.storageKey || '').startsWith('dev_vid_') ||
+            String(item.videoUrl || '').includes('127.0.0.1') ||
+            String(item.videoUrl || '').includes('maxplay.local')
+        );
+
+        // Path 3: Fast Direct Stream Relay Fallback (Only for online catalog streams, NEVER for local phone videos)
+        if (!transferredOk && !isLocalSentVideo) {
+          let candidateUrl = item.videoUrl || '';
+          let secondaryUrl = item.secondaryVideoUrl || '';
+
+          if ((!candidateUrl || !secondaryUrl) && item.contentId) {
+            const catItem = contentList.find((c) => c.id === item.contentId);
+            if (catItem) {
+              if (item.episodeIndex !== undefined && catItem.seasons) {
+                const ep =
+                  catItem.seasons[item.seasonIndex || 0]?.episodes?.[item.episodeIndex];
+                if (!candidateUrl) candidateUrl = ep?.videoUrl || '';
+                if (!secondaryUrl) secondaryUrl = (ep as any)?.secondaryVideoUrl || '';
+              } else {
+                if (!candidateUrl) candidateUrl = catItem.videoUrl || '';
+                if (!secondaryUrl) secondaryUrl = (catItem as any).secondaryVideoUrl || '';
+              }
+            }
+          }
+
+          const relayCandidates = [candidateUrl, secondaryUrl].filter(
+            (u, idx, arr) => Boolean(u && u.trim()) && arr.indexOf(u) === idx
+          );
+
+          for (const rawSource of relayCandidates) {
+            if (transferredOk) break;
+            try {
+              const overallStartPct = toOverallPct(14);
+              setTransferStatus({
+                active: true,
+                mode: 'receive',
+                progress: overallStartPct,
+                message: `${batchPrefix}Receiving "${itemLabel}" via MaxPlay High-Speed Relay...`,
+              });
+              syncLiveProgressToSender(overallStartPct);
+
+              let playUrl = rawSource;
+              const refererUrl = SmartStreamService.resolveEmbedReferer(rawSource);
+              if (SmartStreamService.isExtractableSource(rawSource, true)) {
+                const resolved = await SmartStreamService.resolveStream(rawSource);
+                if (resolved && resolved.streamUrl) {
+                  playUrl = resolved.streamUrl;
+                }
+              }
+
+              const dlRes = await ClientHlsDownloader.downloadStream(
+                targetStorageKey,
+                playUrl,
+                item.quality || '720p',
+                (info) => {
+                  const itemPct = Math.min(
+                    99,
+                    Math.max(
+                      15,
+                      Math.round(
+                        (info.downloadedBytes / Math.max(1, info.totalEstimatedBytes)) * 100
+                      )
+                    )
+                  );
+                  const overallPct = toOverallPct(itemPct);
+                  const mbNow = Math.round((info.downloadedBytes / (1024 * 1024)) * 10) / 10;
+                  const mbTotal = Math.max(
+                    expectedTotalMb,
+                    Math.round((info.totalEstimatedBytes / (1024 * 1024)) * 10) / 10
+                  );
+                  const speedMb = Math.max(
+                    0.5,
+                    Math.round((info.speedBps / (1024 * 1024)) * 10) / 10
+                  );
+                  setTransferStatus({
+                    active: true,
+                    mode: 'receive',
+                    progress: overallPct,
+                    message: `${batchPrefix}Receiving "${itemLabel}" (${mbNow} MB / ${mbTotal} MB • ${speedMb} MB/s)`,
+                  });
+                  syncLiveProgressToSender(overallPct);
+                },
+                item.language || 'Hindi',
+                transferredBytes,
+                refererUrl
+              );
+
+              if (dlRes && dlRes.totalBytes > 0) {
+                transferredOk = true;
+                transferredBytes = dlRes.totalBytes;
+              }
+            } catch (relayErr) {
+              console.warn('[DownloadsScreen] Relay candidate fallback:', relayErr);
+            }
+          }
+        }
+
+        if (!transferredOk) {
+          if (receivedCount === 0) {
+            setTransferStatus(null);
+            triggerToast(
+              'Could not connect to sender phone. Make sure both phones are on the same Wi-Fi/Hotspot.'
+            );
+            return;
+          }
+          continue;
+        }
+
+        const finalSizeMb = Math.max(
+          1,
+          Math.round((transferredBytes / (1024 * 1024)) * 10) / 10
+        );
+
+        // If a local phone video was transferred, also save/export it to the receiver phone's public Gallery (Movies/MaxPlay)
+        if (isLocalSentVideo && NativeBridgeService.isRunningInKotlinApp()) {
+          try {
+            NativeBridgeService.exportOfflineVideoToGalleryNative(
+              targetStorageKey,
+              item.title || 'MaxPlay_Video'
+            );
+            scanPhoneLocalVideos(false);
+          } catch {}
+        }
+
+        const nativePlayUrl = NativeBridgeService.supportsNativeOfflineVault()
+          ? NativeBridgeService.getOfflinePlaybackUrlNative(targetStorageKey) || undefined
+          : undefined;
+
+        downloadManager.addImportedCompletedFile({
+          contentId: item.contentId,
+          episodeId: item.episodeId,
+          seasonIndex: item.seasonIndex,
+          episodeIndex: item.episodeIndex,
+          title: item.title,
+          subtitle: isLocalSentVideo
+            ? `${item.subtitle || 'Saved to Phone Gallery'} • Gallery & MaxPlay`
+            : item.subtitle,
+          posterUrl: item.posterUrl,
+          quality: item.quality || '720p',
+          language: item.language || 'Default',
+          fileSizeMb: finalSizeMb,
+          category: 'received',
+          storageKey: targetStorageKey,
+        });
+        if (nativePlayUrl) {
+          const allAfter = downloadManager.getCompletedFiles();
+          const addedItem = allAfter.find((f) => f.storageKey === targetStorageKey);
+          if (addedItem) {
+            addedItem.videoUrl = nativePlayUrl;
+          }
+        }
+        receivedCount++;
+      }
+
+      completedReceiveCodesRef.current.add(cleanCode);
+      setNearbySessions((prev) => prev.filter((s) => s.code !== cleanCode));
+
+      setTransferStatus({
+        active: true,
+        mode: 'receive',
+        progress: 100,
+        message: `100% Received! ${receivedCount > 1 ? `${receivedCount} videos` : `"${session.title}"`} saved in Received tab.`,
+      });
+
+      try {
+        await setDoc(
+          sessionRef,
+          { status: 'completed', progress: 100 },
+          { merge: true }
+        );
+        setTimeout(() => {
+          deleteDoc(sessionRef).catch(() => {});
+        }, 3500);
+      } catch {}
+
+      setTimeout(() => {
+        setTransferStatus(null);
+      }, 1500);
+      setShowTransferModal(false);
+      setReceiveCodeInput('');
+      setActiveFilter('received');
+      triggerToast(
+        `100% Received ${receivedCount > 1 ? `${receivedCount} videos` : `"${session.title}"`} directly into Received tab!`
+      );
+    } catch (err) {
+      console.error('Direct App-to-App receive failed:', err);
+      setTransferStatus(null);
+      triggerToast('Direct transfer interrupted. Please try again.');
+    } finally {
+      activeReceiveCodeRef.current = null;
+    }
+  };
+
+  const handleReceiveByCodeSubmit = async () => {
+    const clean = receiveCodeInput.replace(/\D/g, '').trim();
+    if (clean.length < 6) {
+      triggerToast('Please enter the 6-digit MaxPlay Transfer Code.');
+      return;
+    }
+    try {
+      setTransferStatus({
+        active: true,
+        mode: 'receive',
+        progress: 5,
+        message: `Looking up Transfer Code ${clean}...`,
+      });
+      const snap = await getDoc(doc(db, 'downloads', 'p2p_sessions', 'tasks', clean));
+      if (!snap.exists()) {
+        setTransferStatus(null);
+        triggerToast('Invalid or expired Transfer Code! Ask sender to tap Send Direct again.');
+        return;
+      }
+      const session = snap.data() as DirectTransferSession;
+      await handleReceiveDirectBySession(session);
+    } catch {
+      setTransferStatus(null);
+      triggerToast('Could not verify Transfer Code.');
+    }
+  };
+
+  // Receive & Import a .maxplay file into the 'received' category (legacy backup option)
+  const handleReceiveFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    try {
+      setTransferStatus({
+        active: true,
+        mode: 'receive',
+        progress: 5,
+        message: `Verifying MaxPlay container "${file.name}"...`,
+      });
+
+      const imported = await ClientHlsDownloader.importFromMaxPlayContainer(
+        file,
+        (pct, statusText) => {
+          setTransferStatus({
+            active: true,
+            mode: 'receive',
+            progress: pct,
+            message: statusText || `Unpacking offline segments into MaxPlay Vault (${pct}%)...`,
+          });
+        }
+      );
+
+      if (!imported) {
+        setTransferStatus(null);
+        triggerToast('Invalid file! Only .maxplay files exported from MaxPlay can be received.');
+        return;
+      }
+
+      const fileSizeMb =
+        imported.metadata.fileSizeMb ||
+        imported.metadata.sizeMb ||
+        Math.max(1, Math.round((imported.totalBytes / (1024 * 1024)) * 10) / 10);
+
+      downloadManager.addImportedCompletedFile({
+        contentId: imported.metadata.contentId,
+        episodeId: imported.metadata.episodeId,
+        seasonIndex: imported.metadata.seasonIndex,
+        episodeIndex: imported.metadata.episodeIndex,
+        title: imported.metadata.title || file.name.replace(/\.maxplay$/i, ''),
+        subtitle: imported.metadata.subtitle,
+        posterUrl: imported.metadata.posterUrl,
+        quality: imported.metadata.quality || '720p',
+        language: imported.metadata.language || imported.metadata.audioLang || 'Default',
+        fileSizeMb,
+        category: 'received',
+        storageKey: imported.storageKey,
+      });
+
+      setTransferStatus(null);
+      setShowTransferModal(false);
+      setActiveFilter('received');
+      triggerToast(`Received "${imported.metadata.title}" into Received tab!`);
+    } catch (err) {
+      console.error('Receive transfer failed:', err);
+      setTransferStatus(null);
+      triggerToast('Failed to receive .maxplay file.');
+    }
+  };
+
+  // Import a local video file (.mp4 / .mkv / .webm) into the 'local' category
+  const handleLocalVideoSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    try {
+      setTransferStatus({
+        active: true,
+        mode: 'local',
+        progress: 10,
+        message: `Importing local video "${file.name}"...`,
+      });
+
+      const imported = await ClientHlsDownloader.importLocalVideoFile(file, (pct, statusText) => {
+        setTransferStatus({
+          active: true,
+          mode: 'local',
+          progress: pct,
+          message: statusText || `Saving local video to MaxPlay Offline Player (${pct}%)...`,
+        });
+      });
+
+      if (!imported) {
+        setTransferStatus(null);
+        triggerToast('Could not import local video file.');
+        return;
+      }
+
+      downloadManager.addImportedCompletedFile({
+        title: imported.title,
+        posterUrl: imported.posterUrl,
+        quality: imported.quality,
+        language: imported.language,
+        fileSizeMb: imported.fileSizeMb,
+        category: 'local',
+        storageKey: imported.storageKey,
+        isVertical: imported.isVertical,
+      });
+
+      setTransferStatus(null);
+      setActiveFilter('local');
+      triggerToast(`Imported "${imported.title}" to Local files!`);
+    } catch (err) {
+      console.error('Local import failed:', err);
+      setTransferStatus(null);
+      triggerToast('Failed to import local video.');
+    }
+  };
+
+  return (
+    <div className="flex h-full w-full flex-col overflow-y-auto overflow-x-hidden bg-[#0A0A0A] p-4 pb-24 md:pb-8 text-left select-none scrollbar-none">
+      {/* Hidden File Inputs for Receive (.maxplay) and Local Video Import */}
+      <input
+        ref={receiveInputRef}
+        type="file"
+        accept=".maxplay,application/octet-stream"
+        className="hidden"
+        onChange={handleReceiveFileSelected}
+      />
+      <input
+        ref={localVideoInputRef}
+        type="file"
+        accept="video/*,.mp4,.mkv,.webm,.mov"
+        className="hidden"
+        onChange={handleLocalVideoSelected}
+      />
+
+      {/* HEADER */}
+      <div className="flex items-center justify-between py-2">
+        <h1 className="text-2xl font-black text-white tracking-tight">Downloads</h1>
+
+        <div className="flex items-center gap-2">
+          {/* Direct App-to-App Transfer button (top-right) */}
+          <button
+            type="button"
+            onClick={() => {
+              const freshFiles = downloadManager
+                .getCompletedFiles()
+                .filter((f) => f.category !== 'local');
+              setCompletedFiles(downloadManager.getCompletedFiles());
+              setSelectedSendFileId(freshFiles[0]?.id || null);
+              setShowTransferModal(true);
+            }}
+            className="flex items-center gap-1.5 rounded-xl bg-[#121212] px-3.5 py-2 text-xs font-bold text-[#10B981] border border-[#10B981]/30 hover:bg-[#10B981]/10 transition cursor-pointer active:scale-95"
+          >
+            <Share2 className="h-4 w-4" />
+            <span>Transfer</span>
+          </button>
+        </div>
+      </div>
+
+      {/* LIVE TRANSFER / IMPORT PROGRESS INDICATOR BAR */}
+      {transferStatus && transferStatus.active && (
+        <div className="mt-3 rounded-2xl bg-gradient-to-r from-emerald-950/80 via-[#111922] to-[#121218] p-3.5 border border-emerald-500/40 shadow-lg">
+          <div className="flex items-center justify-between gap-2 mb-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <Loader2 className="h-4 w-4 text-emerald-400 animate-spin shrink-0" />
+              <span className="text-xs font-bold text-white truncate">{transferStatus.message}</span>
+            </div>
+            <span className="rounded-lg bg-emerald-500/20 border border-emerald-500/40 px-2 py-0.5 text-xs font-black text-emerald-300 shrink-0">
+              {transferStatus.progress}%
+            </span>
+          </div>
+          <div className="h-2.5 w-full rounded-full bg-black/70 overflow-hidden border border-white/5">
+            <div
+              className="h-full bg-gradient-to-r from-emerald-500 via-teal-400 to-cyan-400 transition-all duration-200 rounded-full"
+              style={{ width: `${Math.min(100, Math.max(4, transferStatus.progress))}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* TOAST FEEDBACK BANNER */}
+      {toastMsg && (
+        <div className="mt-3 flex items-center justify-center">
+          <div className="inline-flex items-center gap-2 rounded-full bg-[#18181B] border border-emerald-500/40 px-4 py-1.5 text-xs font-bold text-emerald-300 shadow-lg">
+            <Check className="h-3.5 w-3.5 text-emerald-400" />
+            <span>{toastMsg}</span>
+          </div>
+        </div>
+      )}
+
+      {/* SECTION 2: DOWNLOADING QUEUE */}
+      {activeDownloadingTasks.length > 0 && (
+        <div className="mt-5 flex flex-col gap-3">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-bold text-white">
+              Downloading ({activeDownloadingTasks.length})
+            </h3>
+            <button
+              onClick={() => {
+                activeDownloadingTasks.forEach((t) => handlePauseResume(t.taskId));
+              }}
+              className="text-xs font-semibold text-[#06B6D4] hover:underline cursor-pointer"
+            >
+              Manage
+            </button>
+          </div>
+
+          <div className="flex flex-col gap-2.5">
+            {activeDownloadingTasks.map((task) => (
+              <DownloadItem
+                key={task.taskId}
+                task={task}
+                onPauseResume={handlePauseResume}
+                onCancel={handleCancel}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="mt-4">
+        <NativeBanner />
+      </div>
+
+      {/* SECTION 3: DOWNLOADED (COMPLETED) - Supports Smooth 60 FPS Horizontal Swipe Between Maxbox, Musics, Local files, and Received */}
+      <div
+        className="mt-5 flex flex-col gap-3 touch-pan-y"
+        onTouchStart={(e) => {
+          if (e.touches.length === 1) {
+            swipeTouchStartRef.current = {
+              x: e.touches[0].clientX,
+              y: e.touches[0].clientY,
+            };
+          }
+        }}
+        onTouchEnd={(e) => {
+          const start = swipeTouchStartRef.current;
+          swipeTouchStartRef.current = null;
+          if (!start || e.changedTouches.length === 0) return;
+          const dx = e.changedTouches[0].clientX - start.x;
+          const dy = e.changedTouches[0].clientY - start.y;
+          // Responsive horizontal swipe (> 38px and primarily horizontal)
+          if (Math.abs(dx) > 38 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+            const pillOrder: Array<'moviebox' | 'local' | 'received'> = [
+              'moviebox',
+              'local',
+              'received',
+            ];
+            const currentIdx = pillOrder.indexOf(activeFilter);
+            if (dx < 0 && currentIdx < pillOrder.length - 1) {
+              // Swiped left -> go to next pill (Maxbox -> Local files -> Received)
+              setActiveFilter(pillOrder[currentIdx + 1]);
+            } else if (dx > 0 && currentIdx > 0) {
+              // Swiped right -> go to previous pill (Received -> Local files -> Maxbox)
+              setActiveFilter(pillOrder[currentIdx - 1]);
+            }
+          }
+        }}
+      >
+        {/* Filter Tabs + Storage Pill Placed Right Next to Received */}
+        <div className="flex items-center gap-1.5 sm:gap-2 overflow-x-auto scrollbar-none py-0.5 max-w-full">
+          <button
+            type="button"
+            onClick={() => setActiveFilter('moviebox')}
+            className={`shrink-0 rounded-xl px-2.5 sm:px-3 py-1.5 text-[11px] sm:text-xs font-bold transition cursor-pointer ${
+              activeFilter === 'moviebox'
+                ? 'bg-white text-black shadow-md'
+                : 'bg-[#121212] text-[#A1A1AA] border border-[#1C1C1E]'
+            }`}
+          >
+            Maxbox ({completedFiles.filter((f) => f.category === 'moviebox' || !f.category).length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveFilter('local')}
+            className={`shrink-0 rounded-xl px-2.5 sm:px-3 py-1.5 text-[11px] sm:text-xs font-bold transition cursor-pointer ${
+              activeFilter === 'local'
+                ? 'bg-white text-black shadow-md'
+                : 'bg-[#121212] text-[#A1A1AA] border border-[#1C1C1E]'
+            }`}
+          >
+            Local files ({totalLocalFilesCount})
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveFilter('received')}
+            className={`shrink-0 rounded-xl px-2.5 sm:px-3 py-1.5 text-[11px] sm:text-xs font-bold transition cursor-pointer ${
+              activeFilter === 'received'
+                ? 'bg-white text-black shadow-md'
+                : 'bg-[#121212] text-[#A1A1AA] border border-[#1C1C1E]'
+            }`}
+          >
+            Received ({completedFiles.filter((f) => f.category === 'received').length})
+          </button>
+
+          {/* Phone Available Storage Pill Placed Directly Next to Received */}
+          <div className="shrink-0 flex items-center gap-1.5 rounded-xl bg-[#121212] border border-[#1C1C1E] px-2.5 sm:px-3 py-1.5 text-[11px] sm:text-xs font-bold text-[#A1A1AA]">
+            <HardDrive className="h-3.5 w-3.5 text-[#06B6D4] shrink-0" />
+            <span>
+              {storageInfo ? `${storageInfo.freeGb} GB Free` : '3.5 GB Free'}
+            </span>
+          </div>
+        </div>
+
+        {/* Local Files Quick Action Bar when viewing Local files tab */}
+        {activeFilter === 'local' && (
+          <div className="flex items-center justify-between gap-2 rounded-xl bg-[#13131A] border border-purple-500/20 px-3 py-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <Smartphone className="h-4 w-4 text-purple-400 shrink-0" />
+              <span className="text-[11px] font-semibold text-zinc-300 truncate">
+                {deviceScannedVideos.length > 0
+                  ? `${deviceScannedVideos.length} videos auto-detected`
+                  : 'Auto-scans MP4/MKV videos in phone storage'}
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  if (showLocalFoldersView && selectedLocalFolder) {
+                    setSelectedLocalFolder(null);
+                  } else {
+                    setShowLocalFoldersView((prev) => !prev);
+                    setSelectedLocalFolder(null);
+                  }
+                }}
+                className={`flex items-center gap-1 rounded-lg px-2.5 py-1 text-[11px] font-bold active:scale-95 transition cursor-pointer ${
+                  showLocalFoldersView
+                    ? 'bg-purple-600 text-white border border-purple-400/60 shadow-sm shadow-purple-600/30'
+                    : 'bg-white/10 border border-white/15 text-white hover:bg-white/15'
+                }`}
+              >
+                <FolderOpen className="h-3 w-3 text-purple-300" />
+                <span>Folders</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => localVideoInputRef.current?.click()}
+                className="flex items-center gap-1 rounded-lg bg-white/10 border border-white/15 px-2.5 py-1 text-[11px] font-bold text-white hover:bg-white/15 active:scale-95 transition cursor-pointer"
+              >
+                <Film className="h-3 w-3 text-purple-300" />
+                <span>Pick File</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => scanPhoneLocalVideos(true)}
+                className="flex items-center gap-1 rounded-lg bg-purple-500/20 border border-purple-500/40 px-2.5 py-1 text-[11px] font-bold text-purple-300 hover:bg-purple-500/30 active:scale-95 transition cursor-pointer"
+              >
+                <RefreshCw className={`h-3 w-3 ${isScanningLocalVideos ? 'animate-spin' : ''}`} />
+                <span>Rescan</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Active Local Folder Header Bar when user tapped a specific folder */}
+        {activeFilter === 'local' && showLocalFoldersView && selectedLocalFolder && (
+          <div className="flex items-center justify-between gap-2 rounded-xl bg-[#181822] border border-purple-500/30 px-3 py-2">
+            <button
+              type="button"
+              onClick={() => setSelectedLocalFolder(null)}
+              className="flex items-center gap-2 text-xs font-extrabold text-purple-300 hover:text-white transition cursor-pointer"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              <span>All Video Folders</span>
+            </button>
+            <span className="text-xs font-black text-white truncate">
+              {selectedLocalFolder} ({filteredCompletedFiles.length} videos)
+            </span>
+          </div>
+        )}
+
+        {/* Local Video Folders Grid when Folders button is toggled ON and no specific folder is selected yet */}
+        {activeFilter === 'local' && showLocalFoldersView && !selectedLocalFolder ? (
+          localVideoFolders.length > 0 ? (
+            <div className="flex flex-col gap-2.5">
+              {localVideoFolders.map((folder) => {
+                const sizeText =
+                  folder.totalMb >= 1024
+                    ? `${(folder.totalMb / 1024).toFixed(1)} GB`
+                    : `${Math.round(folder.totalMb)} MB`;
+                return (
+                  <button
+                    key={folder.folderName}
+                    type="button"
+                    onClick={() => setSelectedLocalFolder(folder.folderName)}
+                    className="flex items-center justify-between gap-3 rounded-2xl bg-[#141418] hover:bg-[#1B1B22] border border-white/10 hover:border-purple-500/40 p-3 text-left transition cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="relative h-14 w-20 rounded-xl overflow-hidden bg-[#1E1E26] border border-purple-500/30 flex items-center justify-center shrink-0">
+                        {folder.previewPoster ? (
+                          <img
+                            src={folder.previewPoster}
+                            alt={folder.folderName}
+                            className="h-full w-full object-cover opacity-75 group-hover:scale-105 transition"
+                            onError={(e) => {
+                              (e.target as HTMLElement).style.display = 'none';
+                            }}
+                          />
+                        ) : null}
+                        <div className="absolute inset-0 bg-black/40 flex items-center justify-center">
+                          <FolderOpen className="h-6 w-6 text-purple-300 drop-shadow" />
+                        </div>
+                      </div>
+                      <div className="flex flex-col min-w-0">
+                        <span className="text-sm font-extrabold text-white truncate group-hover:text-purple-300 transition">
+                          {folder.folderName}
+                        </span>
+                        <span className="mt-0.5 text-xs font-semibold text-zinc-400">
+                          {folder.videos.length} {folder.videos.length === 1 ? 'video' : 'videos'} • {sizeText}
+                        </span>
+                      </div>
+                    </div>
+                    <span className="rounded-lg bg-purple-500/15 border border-purple-500/30 px-2.5 py-1 text-[11px] font-bold text-purple-300 shrink-0">
+                      Open
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="flex flex-col items-center justify-center rounded-2xl bg-[#121212] py-10 px-4 border border-[#1C1C1E] text-center">
+              <FolderOpen className="h-10 w-10 text-purple-400/70" />
+              <span className="mt-2 text-sm font-bold text-white">No video folders detected yet</span>
+              <span className="mt-0.5 text-xs text-[#6B7280] max-w-xs">
+                Tap Rescan or Pick File to detect folders containing videos on your device.
+              </span>
+            </div>
+          )
+        ) : groupedCompleted.totalCount > 0 ? (
+          <div className="flex flex-col gap-3">
+            {/* Render Series / Anime Cards (Opens Dedicated Series Episodes Page on click) */}
+            {groupedCompleted.seriesList.map((series) => (
+              <SeriesFolderCard
+                key={series.contentId}
+                seriesTitle={series.seriesTitle}
+                posterUrl={series.posterUrl}
+                episodes={series.episodes}
+                onPlayEpisode={(ep) => handlePlayItem(ep, series.episodes)}
+                onDeleteEpisode={handleDeleteCompleted}
+                onOpenSeriesPage={(title, poster, eps) =>
+                  setActiveSeriesFolderPage({ seriesTitle: title, posterUrl: poster, episodes: eps })
+                }
+                onDeleteSeries={(episodes) => {
+                  const ids = episodes.map((ep) => ep.id);
+                  if (selectedSendFileId && ids.includes(selectedSendFileId)) {
+                    setSelectedSendFileId(null);
+                  }
+                  if (
+                    activeSendSession &&
+                    episodes.some((ep) => ep.storageKey === activeSendSession.storageKey)
+                  ) {
+                    if (sendSessionUnsubRef.current) {
+                      sendSessionUnsubRef.current();
+                      sendSessionUnsubRef.current = null;
+                    }
+                    NativeBridgeService.stopDirectTransferServerNative();
+                    deleteDoc(
+                      doc(db, 'downloads', 'p2p_sessions', 'tasks', activeSendSession.code)
+                    ).catch(() => {});
+                    setActiveSendSession(null);
+                    setTransferStatus(null);
+                  }
+                  downloadManager.removeCompletedFilesBatch(ids);
+                  setCompletedFiles(downloadManager.getCompletedFiles());
+                  triggerToast('Deleted series removed from Downloads & Transfer list');
+                }}
+              />
+            ))}
+
+            {/* Render Standalone Movies & Local Phone Videos */}
+            {groupedCompleted.standaloneMovies.map((file) => (
+              <DownloadedItem
+                key={file.id}
+                item={file}
+                onPlay={(item) => handlePlayItem(item)}
+                onDelete={handleDeleteCompleted}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="flex flex-col items-center justify-center rounded-2xl bg-[#121212] py-10 px-4 border border-[#1C1C1E] text-center">
+            {activeFilter === 'local' ? (
+              <>
+                <Film className="h-10 w-10 text-purple-400/70" />
+                <span className="mt-2 text-sm font-bold text-white">
+                  No local videos found yet
+                </span>
+                <span className="mt-0.5 text-xs text-[#6B7280] max-w-xs">
+                  Allow video storage access to automatically list all videos on your phone, or pick any video file to play in MaxPlay.
+                </span>
+                <div className="mt-4 flex flex-wrap items-center justify-center gap-2.5">
+                  {NativeBridgeService.isRunningInKotlinApp() && (
+                    <button
+                      type="button"
+                      onClick={() => scanPhoneLocalVideos(true)}
+                      className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-[#8B5CF6] to-[#6366F1] px-4 py-2.5 text-xs font-extrabold text-white shadow-lg shadow-purple-600/30 active:scale-95 transition cursor-pointer"
+                    >
+                      <RefreshCw className={`h-4 w-4 ${isScanningLocalVideos ? 'animate-spin' : ''}`} />
+                      <span>Scan Phone Videos</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => localVideoInputRef.current?.click()}
+                    className="flex items-center gap-2 rounded-xl bg-[#1C1C24] border border-purple-500/40 px-4 py-2.5 text-xs font-extrabold text-purple-200 active:scale-95 transition cursor-pointer"
+                  >
+                    <FolderOpen className="h-4 w-4 text-purple-400" />
+                    <span>Select Video from Phone</span>
+                  </button>
+                </div>
+              </>
+            ) : activeFilter === 'received' ? (
+              <>
+                <FileDown className="h-10 w-10 text-emerald-400/70" />
+                <span className="mt-2 text-sm font-bold text-white">No received MaxPlay downloads yet</span>
+                <span className="mt-0.5 text-xs text-[#6B7280] max-w-xs">
+                  Movies and episodes transferred directly from another MaxPlay app appear here ready for offline playback.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTransferTab('receive');
+                    setShowTransferModal(true);
+                  }}
+                  className="mt-4 flex items-center gap-2 rounded-xl bg-[#10B981] px-4 py-2.5 text-xs font-extrabold text-black shadow-lg shadow-emerald-600/30 active:scale-95 transition cursor-pointer"
+                >
+                  <Wifi className="h-4 w-4" />
+                  <span>Receive Direct from MaxPlay</span>
+                </button>
+              </>
+            ) : (
+              <>
+                <Download className="h-10 w-10 text-[#3F3F46]" />
+                <span className="mt-2 text-sm font-bold text-[#A1A1AA]">No downloads yet</span>
+                <span className="mt-0.5 text-xs text-[#6B7280]">
+                  Save movies and shows for offline viewing
+                </span>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* SECTION 4: FOR YOU (REAL CATALOG RECOMMENDATIONS) */}
+      <div className="mt-8 flex flex-col gap-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center">
+            <h3 className="text-sm font-bold text-white">Recommended For You</h3>
+          </div>
+          <span className="text-[11px] text-[#71717A]">Tap any title to watch or download</span>
+        </div>
+
+        <div className="flex gap-3 overflow-x-auto pb-2 scrollbar-none">
+          {recommendedContent.map((item, index) => (
+            <div
+              key={`${item.id}-${refreshSeed}-${index}`}
+              onClick={() => onPlayContent?.(item.id)}
+              className="w-[120px] flex-shrink-0 cursor-pointer"
+            >
+              <ContentCard
+                item={item}
+                onPress={() => onPlayContent?.(item.id)}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* SECTION 5: REFRESH BUTTON */}
+      <div className="mt-6 flex justify-center">
+        <button
+          type="button"
+          onClick={handleRefresh}
+          disabled={isRefreshing}
+          className="flex items-center gap-2 rounded-2xl bg-[#121212] px-6 py-3 text-xs font-bold text-white border border-[#1C1C1E] hover:bg-[#1C1C1E] active:scale-95 transition cursor-pointer"
+        >
+          <RefreshCw className={`h-4 w-4 text-[#06B6D4] ${isRefreshing ? 'animate-spin' : ''}`} />
+          <span>{isRefreshing ? 'Refreshing...' : 'Refresh new content'}</span>
+        </button>
+      </div>
+
+      {/* DIRECT APP-TO-APP MAXPLAY TRANSFER MODAL */}
+      {showTransferModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-4">
+          <div className="flex w-full max-w-md flex-col rounded-3xl bg-[#121216] p-5 sm:p-6 border border-white/10 text-left shadow-2xl max-h-[92vh] overflow-y-auto scrollbar-none">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-gradient-to-tr from-[#10B981]/25 to-[#06B6D4]/25 text-[#10B981] border border-[#10B981]/40 shadow-md">
+                  <Wifi className="h-5 w-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-black text-white">Direct App-to-App Transfer</h3>
+                  <p className="text-[11px] text-[#A1A1AA]">
+                    High-speed P2P transfer between two MaxPlay devices
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowTransferModal(false)}
+                className="p-1.5 rounded-full bg-white/5 text-[#A1A1AA] hover:text-white cursor-pointer"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {/* Mode Switcher Tabs: Send Direct vs Receive Direct */}
+            <div className="mt-4 grid grid-cols-2 gap-2 rounded-2xl bg-[#0A0A0C] p-1 border border-white/5">
+              <button
+                type="button"
+                onClick={() => setTransferTab('send')}
+                className={`flex items-center justify-center gap-1.5 rounded-xl py-2.5 text-xs font-extrabold transition cursor-pointer ${
+                  transferTab === 'send'
+                    ? 'bg-gradient-to-r from-[#10B981] to-[#059669] text-black shadow-md'
+                    : 'text-[#A1A1AA] hover:text-white'
+                }`}
+              >
+                <Send className="h-3.5 w-3.5" />
+                <span>Send Direct</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setTransferTab('receive')}
+                className={`flex items-center justify-center gap-1.5 rounded-xl py-2.5 text-xs font-extrabold transition cursor-pointer ${
+                  transferTab === 'receive'
+                    ? 'bg-gradient-to-r from-[#06B6D4] to-[#10B981] text-black shadow-md'
+                    : 'text-[#A1A1AA] hover:text-white'
+                }`}
+              >
+                <FileDown className="h-3.5 w-3.5" />
+                <span>Receive Direct</span>
+              </button>
+            </div>
+
+            {/* Live Percentage Progress Indicator inside Modal (Visible on both Sender & Receiver!) */}
+            {transferStatus && transferStatus.active && (
+              <div className="mt-4 rounded-2xl bg-gradient-to-r from-emerald-950/70 via-[#0E171D] to-[#12151C] p-3.5 border border-emerald-500/50 shadow-lg">
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Loader2 className="h-4 w-4 text-emerald-400 animate-spin shrink-0" />
+                    <span className="text-xs font-bold text-white truncate">
+                      {transferStatus.message}
+                    </span>
+                  </div>
+                  <span className="rounded-lg bg-emerald-500/20 border border-emerald-400/40 px-2.5 py-0.5 text-xs font-black text-emerald-300 shrink-0">
+                    {transferStatus.progress}%
+                  </span>
+                </div>
+                <div className="h-2.5 w-full rounded-full bg-black/70 overflow-hidden border border-white/10">
+                  <div
+                    className="h-full bg-gradient-to-r from-emerald-400 via-teal-400 to-cyan-400 transition-all duration-200 rounded-full"
+                    style={{ width: `${Math.min(100, Math.max(4, transferStatus.progress))}%` }}
+                  />
+                </div>
+                <div className="mt-1.5 flex items-center justify-between text-[10px] font-semibold text-emerald-300/80">
+                  <span>
+                    {transferStatus.mode === 'send'
+                      ? 'Sender Device • Live P2P Sync'
+                      : 'Receiver Device • Saving to Offline Vault'}
+                  </span>
+                  <span>{transferStatus.progress}% Complete</span>
+                </div>
+              </div>
+            )}
+
+            {transferTab === 'send' ? (
+              <div className="mt-4 flex flex-col gap-3">
+                {/* Styled Step-by-Step Sender Instructions */}
+                <div className="rounded-2xl bg-[#16171F] p-3.5 border border-emerald-500/25">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-[11px] font-black uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+                      <Sparkles className="h-3.5 w-3.5" />
+                      <span>How to Send (Step-by-Step)</span>
+                    </span>
+                    <span className="text-[9px] font-extrabold uppercase px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                      Zero Data P2P
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 gap-1.5 text-[11px] text-zinc-300">
+                    <div className="flex items-start gap-2">
+                      <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-emerald-500/20 text-[10px] font-black text-emerald-300 border border-emerald-500/40">
+                        1
+                      </span>
+                      <span>
+                        Connect both phones to the <strong className="text-white">same Wi-Fi or Hotspot</strong> (or keep both online).
+                      </span>
+                    </div>
+                    <div className="flex items-start gap-2">
+                      <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-emerald-500/20 text-[10px] font-black text-emerald-300 border border-emerald-500/40">
+                        2
+                      </span>
+                      <span>
+                        Tap <strong className="text-emerald-400">Send Direct</strong> next to any movie or episode below to generate your <strong className="text-white">6-Digit Code</strong>.
+                      </span>
+                    </div>
+                    <div className="flex items-start gap-2">
+                      <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-emerald-500/20 text-[10px] font-black text-emerald-300 border border-emerald-500/40">
+                        3
+                      </span>
+                      <span>
+                        On the 2nd phone, open <strong className="text-cyan-300">Transfer &gt; Receive Direct</strong>, enter the code (or tap the auto-detected card), and watch live <strong className="text-emerald-300">0%–100%</strong> progress on both phones!
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Active 6-Digit Direct Transfer Code Box with Live Sender Progress */}
+                {activeSendSession && (
+                  <div className="rounded-2xl bg-gradient-to-b from-emerald-950/60 to-[#14181D] p-4 border border-emerald-500/40 text-center shadow-lg">
+                    <div className="flex items-center justify-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider text-emerald-400">
+                      <span className="h-2 w-2 rounded-full bg-emerald-400 animate-ping" />
+                      <span>
+                        {activeSendSession.status === 'completed'
+                          ? '100% Transfer Completed!'
+                          : activeSendSession.status === 'transferring'
+                          ? `Sending to Receiver Device (${activeSendSession.progress || 10}%)...`
+                          : 'Waiting for Receiver • Enter Code on Receiver Phone'}
+                      </span>
+                    </div>
+
+                    <div className="mt-2.5 flex items-center justify-center gap-2">
+                      <div className="rounded-xl bg-black/80 px-5 py-2.5 border border-emerald-500/50 font-mono text-2xl font-black tracking-[0.25em] text-white shadow-inner">
+                        {activeSendSession.code.slice(0, 3)} {activeSendSession.code.slice(3)}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          navigator.clipboard?.writeText(activeSendSession.code);
+                          triggerToast('Transfer code copied!');
+                        }}
+                        className="p-2.5 rounded-xl bg-white/10 text-emerald-300 hover:bg-white/15 cursor-pointer"
+                        title="Copy Code"
+                      >
+                        <Copy className="h-4 w-4" />
+                      </button>
+                    </div>
+
+                    {/* Live Progress Bar inside Active Session Card on Sender Phone */}
+                    {(activeSendSession.status === 'transferring' ||
+                      activeSendSession.status === 'completed') && (
+                      <div className="mt-3 text-left">
+                        <div className="flex items-center justify-between text-[11px] font-black text-emerald-300 mb-1">
+                          <span>
+                            {activeSendSession.status === 'completed'
+                              ? 'Delivered to Receiver!'
+                              : 'Live Transfer Progress'}
+                          </span>
+                          <span>
+                            {activeSendSession.status === 'completed'
+                              ? '100%'
+                              : `${activeSendSession.progress || 10}%`}
+                          </span>
+                        </div>
+                        <div className="h-2 w-full rounded-full bg-black/70 overflow-hidden border border-emerald-500/30">
+                          <div
+                            className="h-full bg-gradient-to-r from-emerald-400 to-cyan-400 transition-all duration-200 rounded-full"
+                            style={{
+                              width: `${
+                                activeSendSession.status === 'completed'
+                                  ? 100
+                                  : Math.min(99, Math.max(8, activeSendSession.progress || 10))
+                              }%`,
+                            }}
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    <p className="mt-2.5 text-[11px] text-zinc-200 truncate font-bold">
+                      Sharing: {activeSendSession.title} ({activeSendSession.fileSizeMb} MB)
+                    </p>
+                  </div>
+                )}
+
+                {/* Source Filter inside Send Direct: Maxbox/Received vs Local Phone Videos */}
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSendSourceFilter('maxbox');
+                      setSelectedSendFileIds([]);
+                    }}
+                    className={`flex-1 py-1.5 px-3 rounded-xl text-[11px] font-extrabold border transition cursor-pointer ${
+                      sendSourceFilter === 'maxbox'
+                        ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
+                        : 'bg-[#18181D] border-white/10 text-zinc-400 hover:text-white'
+                    }`}
+                  >
+                    Maxbox & Received ({completedFiles.filter((f) => f.category !== 'local' && !f.hasError).length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSendSourceFilter('local');
+                      setSelectedSendFileIds([]);
+                      if (NativeBridgeService.isRunningInKotlinApp()) {
+                        scanPhoneLocalVideos(true);
+                      }
+                    }}
+                    className={`flex-1 py-1.5 px-3 rounded-xl text-[11px] font-extrabold border transition cursor-pointer ${
+                      sendSourceFilter === 'local'
+                        ? 'bg-purple-500/20 border-purple-500 text-purple-300'
+                        : 'bg-[#18181D] border-white/10 text-zinc-400 hover:text-white'
+                    }`}
+                  >
+                    Local Phone Videos ({totalLocalFilesCount})
+                  </button>
+                </div>
+
+                {(() => {
+                  const sendableList =
+                    sendSourceFilter === 'local'
+                      ? [...manualLocalFiles, ...scannedLocalFilesAsDownloaded]
+                      : completedFiles.filter((f) => f.category !== 'local' && !f.hasError);
+
+                  return (
+                    <>
+                      <div className="flex items-center justify-between gap-2 flex-wrap">
+                        <span className="text-xs font-extrabold text-white">
+                          {sendSourceFilter === 'local'
+                            ? `Select Local Phone Videos (${sendableList.length})`
+                            : `Select Maxbox Videos (${sendableList.length})`}
+                        </span>
+                        {sendableList.length > 0 && (
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const allSendableIds = sendableList.map((f) => f.id);
+                                if (selectedSendFileIds.length === allSendableIds.length) {
+                                  setSelectedSendFileIds([]);
+                                } else {
+                                  setSelectedSendFileIds(allSendableIds);
+                                }
+                              }}
+                              className="text-[10px] font-extrabold text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 rounded-lg cursor-pointer"
+                            >
+                              {selectedSendFileIds.length === sendableList.length
+                                ? 'Clear Selection'
+                                : 'Select All'}
+                            </button>
+                            {selectedSendFileIds.length > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const selectedObjs = sendableList.filter((f) =>
+                                    selectedSendFileIds.includes(f.id)
+                                  );
+                                  if (selectedObjs.length > 0) {
+                                    handleStartDirectSendSession(selectedObjs);
+                                  }
+                                }}
+                                className="rounded-lg bg-gradient-to-r from-[#10B981] to-[#06B6D4] px-2.5 py-1 text-[10px] font-black text-black shadow-md hover:brightness-110 active:scale-95 cursor-pointer"
+                              >
+                                Send Selected ({selectedSendFileIds.length})
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+
+                      {sendableList.length > 0 ? (
+                        <div className="max-h-56 overflow-y-auto flex flex-col gap-2 pr-1 scrollbar-none">
+                          {sendableList.map((file) => {
+                            const isChecked = selectedSendFileIds.includes(file.id);
+                            const isSelected = selectedSendFileId === file.id || isChecked;
+                            const isCurrentlySending =
+                              activeSendSession &&
+                              (activeSendSession.storageKey === file.storageKey ||
+                                activeSendSession.batchItems?.some(
+                                  (b) => b.storageKey === file.storageKey
+                                ));
+                            const epLabel =
+                              file.episodeIndex !== undefined ? ` • Ep ${file.episodeIndex + 1}` : '';
+                            return (
+                              <div
+                                key={file.id}
+                                onClick={() => toggleSelectSendFile(file.id)}
+                                className={`flex items-center justify-between gap-2.5 rounded-xl p-2.5 border transition cursor-pointer ${
+                                  isCurrentlySending
+                                    ? 'bg-emerald-500/20 border-emerald-400'
+                                    : isSelected
+                                    ? 'bg-emerald-500/10 border-emerald-500/50'
+                                    : 'bg-[#18181D] border-white/5 hover:border-white/15'
+                                }`}
+                              >
+                                <div className="flex items-center gap-2.5 min-w-0">
+                                  <div
+                                    className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition ${
+                                      isChecked
+                                        ? 'bg-emerald-500 border-emerald-400 text-black'
+                                        : 'bg-black/40 border-white/25 text-transparent'
+                                    }`}
+                                  >
+                                    <CheckCircle2 className="h-3.5 w-3.5" />
+                                  </div>
+                                  <img
+                                    src={file.posterUrl || undefined}
+                                    alt={file.title}
+                                    className="h-11 w-8 rounded-lg object-cover bg-black shrink-0"
+                                  />
+                                  <div className="min-w-0">
+                                    <div className="flex items-center gap-1.5">
+                                      <h4 className="text-xs font-bold text-white truncate">
+                                        {file.title}
+                                        {epLabel}
+                                      </h4>
+                                      {file.category === 'received' && (
+                                        <span className="rounded bg-cyan-500/20 px-1.5 py-0.2 text-[8px] font-black uppercase text-cyan-300 shrink-0">
+                                          Received
+                                        </span>
+                                      )}
+                                      {file.category === 'local' && (
+                                        <span className="rounded bg-purple-500/20 px-1.5 py-0.2 text-[8px] font-black uppercase text-purple-300 shrink-0">
+                                          Local
+                                        </span>
+                                      )}
+                                    </div>
+                                    <p className="text-[10px] text-[#A1A1AA]">
+                                      {file.quality?.toUpperCase() || 'HD'} • {file.language || 'Default'} • {file.fileSizeMb} MB
+                                    </p>
+                                  </div>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleStartDirectSendSession(file);
+                                  }}
+                                  className="shrink-0 rounded-lg bg-gradient-to-r from-[#10B981] to-[#059669] px-3 py-1.5 text-[11px] font-extrabold text-black shadow-md hover:brightness-110 active:scale-95 cursor-pointer"
+                                >
+                                  {isCurrentlySending ? 'Active Code' : 'Send Direct'}
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div className="rounded-2xl bg-[#18181D] p-6 text-center border border-white/5">
+                          <p className="text-xs font-bold text-[#A1A1AA]">
+                            {sendSourceFilter === 'local'
+                              ? 'No supported local phone videos found to send.'
+                              : 'No active Maxbox or Received files available to send.'}
+                          </p>
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
+              </div>
+            ) : (
+              <div className="mt-4 flex flex-col gap-3">
+                {/* Styled Step-by-Step Receiver Instructions */}
+                <div className="rounded-2xl bg-[#141920] p-3.5 border border-cyan-500/25">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-[11px] font-black uppercase tracking-wider text-cyan-400 flex items-center gap-1.5">
+                      <Sparkles className="h-3.5 w-3.5" />
+                      <span>How to Receive (Step-by-Step)</span>
+                    </span>
+                    <span className="text-[9px] font-extrabold uppercase px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+                      Instant Save
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 gap-1.5 text-[11px] text-zinc-300">
+                    <div className="flex items-start gap-2">
+                      <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-cyan-500/20 text-[10px] font-black text-cyan-300 border border-cyan-500/40">
+                        1
+                      </span>
+                      <span>
+                        Ask the Sender phone to open <strong className="text-white">Transfer &gt; Send Direct</strong> and tap <strong className="text-emerald-400">Send Direct</strong> on a video.
+                      </span>
+                    </div>
+                    <div className="flex items-start gap-2">
+                      <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-cyan-500/20 text-[10px] font-black text-cyan-300 border border-cyan-500/40">
+                        2
+                      </span>
+                      <span>
+                        Enter the <strong className="text-white">6-Digit Transfer Code</strong> below or tap <strong className="text-cyan-300">Receive</strong> on the auto-detected session.
+                      </span>
+                    </div>
+                    <div className="flex items-start gap-2">
+                      <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-cyan-500/20 text-[10px] font-black text-cyan-300 border border-cyan-500/40">
+                        3
+                      </span>
+                      <span>
+                        Watch the live <strong className="text-cyan-300">0%–100%</strong> bar complete — your video will play offline in the <strong className="text-white">Received</strong> tab!
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 1. Enter 6-Digit Transfer Code */}
+                <div className="rounded-2xl bg-[#18181D] p-4 border border-white/10">
+                  <label className="block text-xs font-bold text-white mb-1.5">
+                    Enter 6-Digit MaxPlay Transfer Code
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={7}
+                      value={receiveCodeInput}
+                      onChange={(e) => setReceiveCodeInput(e.target.value)}
+                      placeholder="e.g. 482915"
+                      className="flex-1 rounded-xl bg-black/70 border border-cyan-500/40 px-3.5 py-2.5 text-center font-mono text-base font-black tracking-widest text-white placeholder:text-zinc-600 focus:outline-none focus:border-cyan-400"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleReceiveByCodeSubmit}
+                      className="shrink-0 rounded-xl bg-gradient-to-r from-[#06B6D4] to-[#10B981] px-4 py-2.5 text-xs font-black text-black shadow-lg shadow-cyan-500/20 hover:brightness-110 active:scale-95 transition cursor-pointer"
+                    >
+                      Connect
+                    </button>
+                  </div>
+                </div>
+
+                {/* 2. Auto-Discovered Active MaxPlay Transfers */}
+                <div className="rounded-2xl bg-[#18181D] p-3.5 border border-white/5">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-[11px] font-extrabold uppercase tracking-wider text-cyan-400 flex items-center gap-1.5">
+                      <Wifi className="h-3.5 w-3.5" />
+                      <span>Active Nearby MaxPlay Transfers</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={fetchActiveTransferSessions}
+                      className="text-[11px] font-bold text-zinc-400 hover:text-white flex items-center gap-1 cursor-pointer"
+                    >
+                      <RefreshCw className={`h-3 w-3 ${isSearchingSessions ? 'animate-spin' : ''}`} />
+                      <span>Scan</span>
+                    </button>
+                  </div>
+
+                  {nearbySessions.length > 0 ? (
+                    <div className="flex flex-col gap-2 max-h-44 overflow-y-auto pr-1 scrollbar-none">
+                      {nearbySessions.map((sess) => (
+                        <div
+                          key={sess.code}
+                          className="flex items-center justify-between gap-2.5 rounded-xl bg-black/50 p-2.5 border border-cyan-500/25"
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            {sess.posterUrl ? (
+                              <img
+                                src={sess.posterUrl}
+                                alt={sess.title}
+                                className="h-10 w-7 rounded object-cover shrink-0"
+                              />
+                            ) : (
+                              <Film className="h-6 w-6 text-cyan-400 shrink-0" />
+                            )}
+                            <div className="min-w-0">
+                              <h4 className="text-xs font-bold text-white truncate">{sess.title}</h4>
+                              <p className="text-[10px] text-cyan-300 font-semibold">
+                                Code: {sess.code} • {sess.quality || 'HD'} • {sess.fileSizeMb} MB
+                              </p>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleReceiveDirectBySession(sess)}
+                            className="shrink-0 rounded-lg bg-[#06B6D4] px-3 py-1.5 text-[11px] font-black text-black hover:brightness-110 active:scale-95 cursor-pointer"
+                          >
+                            Receive
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-zinc-500 py-2 text-center">
+                      Tap &ldquo;Send Direct&rdquo; on the sender phone&apos;s MaxPlay app to see it appear here automatically.
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* DEDICATED DOWNLOADED SERIES EPISODES PAGE */}
+      {activeSeriesFolderPage && !offlinePlayingFile && (
+        <div className="fixed inset-0 z-40 flex flex-col bg-[#0A0A0C] text-white overflow-hidden select-none animate-in fade-in duration-150">
+          {/* Top Sticky Header */}
+          <div className="flex items-center justify-between px-4 py-3.5 border-b border-white/10 bg-[#101015]/95 backdrop-blur-md shrink-0">
+            <div className="flex items-center gap-3 min-w-0">
+              <button
+                type="button"
+                onClick={() => setActiveSeriesFolderPage(null)}
+                className="p-2 rounded-full bg-white/5 hover:bg-white/10 text-white active:scale-95 transition cursor-pointer shrink-0"
+              >
+                <ArrowLeft className="h-5 w-5" />
+              </button>
+              <div className="min-w-0">
+                <h2 className="text-base sm:text-lg font-extrabold text-white truncate">
+                  {activeSeriesFolderPage.seriesTitle}
+                </h2>
+                <p className="text-[11px] text-zinc-400">
+                  {activeSeriesFolderPage.episodes.length} Downloaded{' '}
+                  {activeSeriesFolderPage.episodes.length === 1 ? 'Episode' : 'Episodes'} • Offline Ready
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Sequential Episodes List (Direct list with vertical series poster thumbnails) */}
+          <div className="flex-1 overflow-y-auto p-4 pb-24 space-y-2.5 scrollbar-none">
+            <div className="space-y-2.5">
+              {activeSeriesFolderPage.episodes.map((ep, idx) => {
+                const epNum =
+                  ep.episodeIndex !== undefined
+                    ? ep.episodeIndex + 1
+                    : parseInt(ep.episodeId?.replace(/\D/g, '') || String(idx + 1), 10) || idx + 1;
+                const sizeLabel =
+                  ep.fileSizeMb >= 1000
+                    ? `${(ep.fileSizeMb / 1024).toFixed(1)} GB`
+                    : `${Math.round(ep.fileSizeMb)} MB`;
+
+                return (
+                  <div
+                    key={ep.id}
+                    onClick={() => handlePlayItem(ep, activeSeriesFolderPage.episodes)}
+                    className="flex items-center justify-between gap-3 rounded-2xl bg-[#14141A] hover:bg-[#1B1B24] border border-white/10 hover:border-purple-500/40 p-3 transition cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-3.5 min-w-0">
+                      <div className="relative h-[84px] w-[58px] rounded-xl overflow-hidden bg-black border border-white/10 shrink-0 flex items-center justify-center shadow-md">
+                        {activeSeriesFolderPage.posterUrl || ep.posterUrl ? (
+                          <img
+                            src={activeSeriesFolderPage.posterUrl || ep.posterUrl}
+                            alt={ep.title}
+                            className="h-full w-full object-cover opacity-90 group-hover:scale-105 transition"
+                          />
+                        ) : null}
+                        <div className="absolute inset-0 bg-black/35 flex items-center justify-center">
+                          <div className="h-7 w-7 rounded-full bg-[#8B5CF6]/90 flex items-center justify-center text-white shadow-md">
+                            <Play className="h-3 w-3 fill-current ml-0.5" />
+                          </div>
+                        </div>
+                        <span className="absolute bottom-1 inset-x-1 text-center rounded bg-black/85 px-1 py-0.2 text-[9px] font-black text-white">
+                          EP {epNum.toString().padStart(2, '0')}
+                        </span>
+                      </div>
+
+                      <div className="flex flex-col min-w-0 text-left">
+                        <h4 className="text-sm font-extrabold text-white truncate group-hover:text-purple-300 transition">
+                          Episode {epNum.toString().padStart(2, '0')}{' '}
+                          {ep.subtitle ? `• ${ep.subtitle.split('•')[0].trim()}` : ''}
+                        </h4>
+                        <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-zinc-400">
+                          {ep.quality && (
+                            <span className="rounded bg-emerald-500/15 border border-emerald-500/30 px-1.5 py-0.2 text-[10px] font-bold text-emerald-300">
+                              {ep.quality}
+                            </span>
+                          )}
+                          {ep.language && (
+                            <span className="rounded bg-sky-500/15 border border-sky-500/30 px-1.5 py-0.2 text-[10px] font-bold text-sky-300">
+                              {ep.language}
+                            </span>
+                          )}
+                          <span>{sizeLabel}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteCompleted(ep.id);
+                        const remaining = activeSeriesFolderPage.episodes.filter(
+                          (item) => item.id !== ep.id
+                        );
+                        if (remaining.length === 0) {
+                          setActiveSeriesFolderPage(null);
+                        } else {
+                          setActiveSeriesFolderPage({
+                            ...activeSeriesFolderPage,
+                            episodes: remaining,
+                          });
+                        }
+                      }}
+                      className="p-2 rounded-xl text-zinc-500 hover:bg-red-500/20 hover:text-red-400 transition cursor-pointer shrink-0"
+                      title="Delete episode"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Offline MaxPlay Detail Screen with Top Player & Episode Grid */}
+      {offlinePlayingFile && (
+        <OfflineDetailScreen
+          initialFile={offlinePlayingFile}
+          initialBlobUrl={offlineBlobUrl || undefined}
+          allDownloadedEpisodes={offlinePlayingEpisodes}
+          onBack={() => {
+            setOfflinePlayingFile(null);
+            setOfflineBlobUrl(null);
+            setOfflinePlayingEpisodes([]);
+          }}
+          onSelectContent={(content) => {
+            setOfflinePlayingFile(null);
+            setOfflineBlobUrl(null);
+            setOfflinePlayingEpisodes([]);
+            onPlayContent?.(content.id);
+          }}
+        />
+      )}
+    </div>
+  );
+};

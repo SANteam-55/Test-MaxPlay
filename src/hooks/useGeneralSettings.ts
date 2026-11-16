@@ -1,0 +1,512 @@
+import { useState, useEffect, useCallback } from 'react';
+import { doc, onSnapshot, getDoc, getDocs, collection } from 'firebase/firestore';
+import { db } from '../services/firebase';
+import { subscribeToAnnouncements, MESSAGES_COLLECTION } from '../services/contentService';
+
+export const DEFAULT_INSTALLED_APK_VERSION = 'v2.6.0';
+
+export function formatVersionTag(ver?: string): string {
+  if (!ver || typeof ver !== 'string') return DEFAULT_INSTALLED_APK_VERSION;
+  const trimmed = ver.trim();
+  if (!trimmed) return DEFAULT_INSTALLED_APK_VERSION;
+  return /^v/i.test(trimmed) ? `v${trimmed.slice(1)}` : `v${trimmed}`;
+}
+
+export function cleanVersionDigits(ver?: string): string {
+  if (!ver || typeof ver !== 'string') return '';
+  const match = ver.trim().match(/(\d+(?:\.\d+)*)/);
+  return match ? match[1] : '';
+}
+
+export function isVersionNewer(remoteVersion?: string, localVersion: string = DEFAULT_INSTALLED_APK_VERSION): boolean {
+  const cleanRemote = cleanVersionDigits(remoteVersion);
+  const cleanLocal = cleanVersionDigits(localVersion);
+  if (!cleanRemote || !cleanLocal || cleanRemote === cleanLocal) return false;
+
+  const rParts = cleanRemote.split('.').map((n) => parseInt(n, 10) || 0);
+  const lParts = cleanLocal.split('.').map((n) => parseInt(n, 10) || 0);
+  const maxLen = Math.max(rParts.length, lParts.length);
+
+  for (let i = 0; i < maxLen; i++) {
+    const r = rParts[i] || 0;
+    const l = lParts[i] || 0;
+    if (r > l) return true;
+    if (r < l) return false;
+  }
+  return false;
+}
+
+/**
+ * Returns true if the message is an Admin APK/App Update announcement whose target version
+ * is already installed (i.e. targetVersion <= currentVersion).
+ * Used to hide already-installed update messages from the user's Inbox and unread badges.
+ */
+export function isUpdateMessageAlreadyInstalled(
+  msg: any,
+  currentVersion: string = DEFAULT_INSTALLED_APK_VERSION
+): boolean {
+  const detectedVer = extractVersionFromAdminMessage(msg);
+  if (!detectedVer) return false;
+  return !isVersionNewer(detectedVer, currentVersion);
+}
+
+/**
+ * Extracts a version string from an Admin Announcement / Message if it represents an App/APK update.
+ * Supports:
+ * - Explicit fields: `apkVersion`, `appVersion`, `version`, `latestVersion`, `updateVersion`
+ * - `v2.6.0`, `v2.6`, `v3.0` anywhere in title or body
+ * - `Update 2.6.0`, `Version 2.6`, `APK 2.6.0`, `MaxPlay 2.6` in title or body
+ */
+export function extractVersionFromAdminMessage(msg: any): string {
+  if (!msg || typeof msg !== 'object') return '';
+
+  const explicit =
+    msg.apkVersion ||
+    msg.updateVersion ||
+    msg.latestVersion ||
+    msg.appVersion ||
+    msg.version ||
+    '';
+  if (explicit && cleanVersionDigits(String(explicit))) {
+    return cleanVersionDigits(String(explicit));
+  }
+
+  const title = String(msg.title || '').trim();
+  const body = String(msg.body || '').trim();
+  const combined = `${title}\n${body}`;
+  const msgType = String(msg.type || '').toLowerCase();
+
+  const candidateVersions: string[] = [];
+
+  // Pattern 1: Explicit 'v' prefix followed by major.minor(.patch), e.g., v2.6.0, v2.6, v3.0
+  const vPrefixRegex = /\bv\s*(\d+\.\d+(?:\.\d+){0,2})\b/gi;
+  let m: RegExpExecArray | null;
+  while ((m = vPrefixRegex.exec(combined)) !== null) {
+    if (m[1]) candidateVersions.push(m[1]);
+  }
+
+  // Pattern 2: Keyword (update, apk, version, upgrade, build, release, maxplay, force) followed by version
+  const keywordVerRegex =
+    /\b(?:update|apk|version|ver|upgrade|build|release|maxplay|force\s+update)\s*(?:to|is|available|now|v|:|-|#)?\s*v?(\d+(?:\.\d+){1,3})\b/gi;
+  while ((m = keywordVerRegex.exec(combined)) !== null) {
+    if (m[1]) candidateVersions.push(m[1]);
+  }
+
+  // Pattern 3: Version followed by keyword (e.g., "2.6.0 APK" or "2.6.0 Update")
+  const verBeforeKeywordRegex =
+    /\bv?(\d+\.\d+(?:\.\d+){0,2})\s*(?:apk|update|version|release|build)\b/gi;
+  while ((m = verBeforeKeywordRegex.exec(combined)) !== null) {
+    if (m[1]) candidateVersions.push(m[1]);
+  }
+
+  // Pattern 4: If message type or title clearly indicates an app/system update, match any X.Y.Z or X.Y
+  const isUpdateContext =
+    msgType.includes('update') ||
+    msgType.includes('apk') ||
+    /\b(apk|update|version|upgrade|new\s+release|force\s+update)\b/i.test(combined);
+  if (isUpdateContext && candidateVersions.length === 0) {
+    const genericSemver = /\b(\d+\.\d+(?:\.\d+){0,2})\b/g;
+    while ((m = genericSemver.exec(combined)) !== null) {
+      if (m[1]) candidateVersions.push(m[1]);
+    }
+  }
+
+  if (candidateVersions.length === 0) return '';
+
+  // Pick the highest version mentioned in this message
+  let highest = candidateVersions[0];
+  for (let i = 1; i < candidateVersions.length; i++) {
+    if (isVersionNewer(candidateVersions[i], highest)) {
+      highest = candidateVersions[i];
+    }
+  }
+  return highest;
+}
+
+export function isAdminMessageForceUpdate(msg: any): boolean {
+  if (!msg || typeof msg !== 'object') return false;
+  if (msg.forceUpdate === true || msg.isForceUpdate === true || msg.disableOldVersions === true) {
+    return true;
+  }
+  const msgType = String(msg.type || '').toLowerCase();
+  if (msgType.includes('force')) return true;
+
+  const combined = `${msg.title || ''} ${msg.body || ''}`.toLowerCase();
+  if (
+    combined.includes('force update') ||
+    combined.includes('force-update') ||
+    combined.includes('mandatory update') ||
+    combined.includes('compulsory update') ||
+    combined.includes('required update') ||
+    combined.includes('[force]')
+  ) {
+    return true;
+  }
+
+  if (msg.priority === 'urgent' && /\b(apk|update|version|upgrade)\b/i.test(combined)) {
+    return true;
+  }
+
+  return false;
+}
+
+export function extractApkUrlFromMessage(msg: any, fallbackUrl: string = ''): string {
+  if (!msg || typeof msg !== 'object') return fallbackUrl;
+  const direct =
+    msg.actionUrl ||
+    msg.apkUrl ||
+    msg.apkDownloadUrl ||
+    msg.downloadUrl ||
+    msg.updateUrl ||
+    msg.link ||
+    '';
+  if (direct && typeof direct === 'string' && direct.trim()) {
+    return direct.trim();
+  }
+  const body = String(msg.body || '');
+  const urlMatch = body.match(/https?:\/\/[^\s"'<>]+/i);
+  if (urlMatch && urlMatch[0]) {
+    return urlMatch[0].trim();
+  }
+  return fallbackUrl;
+}
+
+export interface AdminUpdateMessageInfo {
+  id: string;
+  version: string;
+  formattedVersion: string;
+  title: string;
+  body: string;
+  downloadUrl: string;
+  bannerUrl: string;
+  isForceUpdate: boolean;
+  date: string;
+  senderName: string;
+  senderHandle: string;
+  senderAvatar?: string;
+}
+
+export function useGeneralSettings() {
+  const [maintenanceMode, setMaintenanceMode] = useState(false);
+  const [appName, setAppName] = useState('MaxPlay');
+  const [customLogoUrl, setCustomLogoUrl] = useState('');
+
+  // The baseline version shown in Me -> Settings -> Check Update (from settings/general.appVersion or v2.6.0)
+  const [installedAppVersion, setInstalledAppVersion] = useState<string>(DEFAULT_INSTALLED_APK_VERSION);
+  const [generalDownloadUrl, setGeneralDownloadUrl] = useState<string>('');
+  const [shareDownloadUrlState, setShareDownloadUrlState] = useState<string>('');
+  const [officialWebsiteUrlState, setOfficialWebsiteUrlState] = useState<string>('https://maxplay.app');
+
+  // Optional direct update fields from settings/update or settings/general
+  const [settingsLatestVersion, setSettingsLatestVersion] = useState<string>('');
+  const [settingsForceUpdate, setSettingsForceUpdate] = useState<boolean>(false);
+  const [settingsMinRequiredVersion, setSettingsMinRequiredVersion] = useState<string>('');
+  const [settingsReleaseNotes, setSettingsReleaseNotes] = useState<string>('');
+  const [settingsUpdateActive, setSettingsUpdateActive] = useState<boolean>(true);
+  const [settingsRedBlinkEnabled, setSettingsRedBlinkEnabled] = useState<boolean>(true);
+  const [withdrawnVersions, setWithdrawnVersions] = useState<string[]>([]);
+
+  // Announcements from Admin Panel (`messages` collection)
+  const [announcements, setAnnouncements] = useState<any[]>([]);
+  const [lastCheckedAt, setLastCheckedAt] = useState<number>(() => Date.now());
+
+  useEffect(() => {
+    const applyUpdateConfigFields = (data: Record<string, any>, isDedicatedUpdateDoc: boolean) => {
+      if (data.updateActive !== undefined) {
+        setSettingsUpdateActive(Boolean(data.updateActive));
+      }
+      if (data.redBlinkEnabled !== undefined) {
+        setSettingsRedBlinkEnabled(Boolean(data.redBlinkEnabled));
+      }
+      if (Array.isArray(data.withdrawnVersions)) {
+        setWithdrawnVersions(data.withdrawnVersions.map((v: any) => cleanVersionDigits(String(v))).filter(Boolean));
+      }
+
+      // Dedicated update fields
+      const dedicatedVer =
+        data.apkVersion ||
+        data.latestVersion ||
+        data.updateVersion ||
+        (isDedicatedUpdateDoc ? data.appVersion || data.version : '') ||
+        '';
+      if (dedicatedVer !== undefined && (dedicatedVer || isDedicatedUpdateDoc)) {
+        setSettingsLatestVersion(String(dedicatedVer || '').trim());
+      }
+
+      const link =
+        data.apkUrl ??
+        data.apkDownloadUrl ??
+        data.apkLink ??
+        data.updateUrl ??
+        data.downloadUrl;
+      if (link !== undefined) {
+        setGeneralDownloadUrl(String(link || '').trim());
+      }
+
+      if (
+        data.forceUpdate !== undefined ||
+        data.isForceUpdate !== undefined ||
+        data.disableOldVersions !== undefined
+      ) {
+        setSettingsForceUpdate(
+          Boolean(data.forceUpdate || data.isForceUpdate || data.disableOldVersions)
+        );
+      }
+
+      const minVer = data.minRequiredVersion ?? data.minVersion;
+      if (minVer !== undefined) {
+        setSettingsMinRequiredVersion(String(minVer || '').trim());
+      }
+
+      const notes =
+        data.updateNotes ??
+        data.releaseNotes ??
+        data.updateMessage ??
+        data.apkDescription;
+      if (notes !== undefined) {
+        setSettingsReleaseNotes(String(notes || '').trim());
+      }
+    };
+
+    const unsubGen = onSnapshot(
+      doc(db, 'settings', 'general'),
+      (snap) => {
+        if (snap.exists()) {
+          const data = snap.data();
+          setMaintenanceMode(Boolean(data.maintenanceMode));
+          if (data.appName) setAppName(data.appName);
+          if (data.customLogoUrl !== undefined) {
+            setCustomLogoUrl(data.customLogoUrl || '');
+          }
+          // `appVersion` in `settings/general` is the baseline version displayed in Me -> Settings -> Check update
+          if (data.appVersion) {
+            setInstalledAppVersion(formatVersionTag(String(data.appVersion)));
+          }
+          const shareLink = data.shareDownloadUrl || data.downloadUrl || data.apkDownloadUrl || data.apkUrl || '';
+          if (shareLink) {
+            setShareDownloadUrlState(String(shareLink).trim());
+          }
+          const webLink = data.officialWebsiteUrl || data.websiteUrl || '';
+          if (webLink && String(webLink).trim()) {
+            setOfficialWebsiteUrlState(String(webLink).trim());
+          }
+          applyUpdateConfigFields(data, false);
+        }
+      },
+      (error) => {
+        console.warn('General settings listener note:', error?.message || error);
+      }
+    );
+
+    const unsubUpdate = onSnapshot(
+      doc(db, 'settings', 'update'),
+      (snap) => {
+        if (snap.exists()) {
+          applyUpdateConfigFields(snap.data(), true);
+        }
+      },
+      () => {}
+    );
+
+    const unsubLegal = onSnapshot(
+      doc(db, 'settings', 'legal'),
+      (snap) => {
+        if (snap.exists()) {
+          const data = snap.data();
+          if (data.customLogoUrl) {
+            setCustomLogoUrl((prev) => prev || data.customLogoUrl);
+          }
+        }
+      },
+      () => {}
+    );
+
+    const unsubMsgs = subscribeToAnnouncements(undefined, (msgs) => {
+      setAnnouncements(Array.isArray(msgs) ? msgs : []);
+    });
+
+    return () => {
+      unsubGen();
+      unsubUpdate();
+      unsubLegal();
+      unsubMsgs();
+    };
+  }, []);
+
+  // Manual trigger to re-verify update status from Firestore on demand (used by Me -> Settings -> Check update)
+  const triggerManualUpdateCheck = useCallback(async () => {
+    let computedHasUpdate = false;
+    let computedLatestVer = cleanVersionDigits(installedAppVersion) || '2.6.0';
+    const currentCleanVer = cleanVersionDigits(installedAppVersion) || '2.6.0';
+    try {
+      const [genSnap, updSnap, msgSnap] = await Promise.allSettled([
+        getDoc(doc(db, 'settings', 'general')),
+        getDoc(doc(db, 'settings', 'update')),
+        getDocs(collection(db, MESSAGES_COLLECTION)),
+      ]);
+
+      let baseVer = installedAppVersion;
+      let activeFlag = settingsUpdateActive;
+      if (genSnap.status === 'fulfilled' && genSnap.value.exists()) {
+        const d = genSnap.value.data();
+        if (d.appVersion) {
+          baseVer = formatVersionTag(String(d.appVersion));
+          setInstalledAppVersion(baseVer);
+        }
+        if (d.downloadUrl !== undefined || d.apkUrl !== undefined) {
+          setGeneralDownloadUrl(String(d.downloadUrl || d.apkUrl || '').trim());
+        }
+        if (d.officialWebsiteUrl || d.websiteUrl) {
+          setOfficialWebsiteUrlState(String(d.officialWebsiteUrl || d.websiteUrl).trim());
+        }
+        if (d.updateActive !== undefined) {
+          activeFlag = Boolean(d.updateActive);
+          setSettingsUpdateActive(activeFlag);
+        }
+        if (d.redBlinkEnabled !== undefined) {
+          setSettingsRedBlinkEnabled(Boolean(d.redBlinkEnabled));
+        }
+      }
+      if (updSnap.status === 'fulfilled' && updSnap.value.exists()) {
+        const d = updSnap.value.data();
+        const ver = d.apkVersion || d.latestVersion || d.updateVersion || d.appVersion || d.version || '';
+        setSettingsLatestVersion(String(ver).trim());
+        if (d.downloadUrl !== undefined || d.apkUrl !== undefined) {
+          setGeneralDownloadUrl(String(d.downloadUrl || d.apkUrl || '').trim());
+        }
+        if (d.updateActive !== undefined) {
+          activeFlag = Boolean(d.updateActive);
+          setSettingsUpdateActive(activeFlag);
+        }
+        if (d.redBlinkEnabled !== undefined) {
+          setSettingsRedBlinkEnabled(Boolean(d.redBlinkEnabled));
+        }
+        if (activeFlag && ver && isVersionNewer(String(ver), baseVer)) {
+          computedHasUpdate = true;
+          computedLatestVer = cleanVersionDigits(String(ver));
+        }
+      }
+      if (msgSnap.status === 'fulfilled') {
+        const list = msgSnap.value.docs.map((docItem) => ({ id: docItem.id, ...docItem.data() }));
+        setAnnouncements(list);
+      }
+      setLastCheckedAt(Date.now());
+    } catch {}
+    return {
+      hasUpdate: computedHasUpdate,
+      latestVer: computedLatestVer,
+      currentVer: currentCleanVer,
+    };
+  }, [installedAppVersion, settingsUpdateActive]);
+
+  // Evaluate Admin Messages (newest-first) against the version in Me -> Settings -> Check Update (`installedAppVersion`)
+  let matchedAdminUpdateMsg: AdminUpdateMessageInfo | null = null;
+  if (settingsUpdateActive && announcements.length > 0) {
+    const sorted = [...announcements].sort((a, b) => {
+      const tA = new Date(a.createdAt || a.date || 0).getTime() || 0;
+      const tB = new Date(b.createdAt || b.date || 0).getTime() || 0;
+      return tB - tA;
+    });
+
+    for (const msg of sorted) {
+      if (msg.isWithdrawn === true || msg.updateActive === false || msg.recalled === true) {
+        continue;
+      }
+      const msgVer = extractVersionFromAdminMessage(msg);
+      if (msgVer && withdrawnVersions.includes(cleanVersionDigits(msgVer))) {
+        continue;
+      }
+      if (msgVer && isVersionNewer(msgVer, installedAppVersion)) {
+        if (!matchedAdminUpdateMsg || isVersionNewer(msgVer, matchedAdminUpdateMsg.version)) {
+          const attachedImg =
+            msg.bannerUrl ||
+            msg.imageUrl ||
+            msg.image ||
+            msg.attachedContent?.backdropUrl ||
+            msg.attachedContent?.posterUrl ||
+            '';
+          matchedAdminUpdateMsg = {
+            id: msg.id || `upd_${msgVer}`,
+            version: msgVer,
+            formattedVersion: formatVersionTag(msgVer),
+            title: msg.title || `MaxPlay APK Update ${formatVersionTag(msgVer)}`,
+            body:
+              msg.body ||
+              `A new official version (${formatVersionTag(msgVer)}) of MaxPlay is now available from Admin. Please update your APK for the latest features and stability improvements.`,
+            downloadUrl: extractApkUrlFromMessage(msg, generalDownloadUrl),
+            bannerUrl: attachedImg,
+            isForceUpdate: isAdminMessageForceUpdate(msg),
+            date: msg.date || (msg.createdAt ? new Date(msg.createdAt).toLocaleDateString() : 'Latest Release'),
+            senderName: msg.sender?.name || 'MaxPlay Official',
+            senderHandle: msg.sender?.handle || '@MaxPlayAdmin',
+            senderAvatar: msg.sender?.avatar || '',
+          };
+        }
+      }
+    }
+  }
+
+  // Combine with dedicated settings/update if higher than installedAppVersion AND updateActive is true
+  const hasSettingsNewer =
+    settingsUpdateActive &&
+    !withdrawnVersions.includes(cleanVersionDigits(settingsLatestVersion)) &&
+    isVersionNewer(settingsLatestVersion, installedAppVersion);
+  const hasMessageNewer = settingsUpdateActive && Boolean(matchedAdminUpdateMsg);
+  const hasApkUpdate = settingsUpdateActive && (hasMessageNewer || hasSettingsNewer);
+  const isRedBlinkActive = hasApkUpdate && settingsRedBlinkEnabled;
+
+  let latestApkVersion = '';
+  if (matchedAdminUpdateMsg && hasSettingsNewer) {
+    latestApkVersion = isVersionNewer(settingsLatestVersion, matchedAdminUpdateMsg.version)
+      ? cleanVersionDigits(settingsLatestVersion)
+      : matchedAdminUpdateMsg.version;
+  } else if (matchedAdminUpdateMsg) {
+    latestApkVersion = matchedAdminUpdateMsg.version;
+  } else if (hasSettingsNewer) {
+    latestApkVersion = cleanVersionDigits(settingsLatestVersion);
+  }
+
+  const apkDownloadUrl =
+    matchedAdminUpdateMsg?.downloadUrl || generalDownloadUrl || '';
+
+  const updateReleaseNotes =
+    matchedAdminUpdateMsg?.body ||
+    settingsReleaseNotes ||
+    '';
+
+  const updateTitle =
+    matchedAdminUpdateMsg?.title ||
+    (latestApkVersion ? `MaxPlay Update v${latestApkVersion} Available` : 'App Update Status');
+
+  const updateBannerUrl = matchedAdminUpdateMsg?.bannerUrl || '';
+
+  const isForceUpdateRequired =
+    settingsUpdateActive &&
+    ((hasMessageNewer && Boolean(matchedAdminUpdateMsg?.isForceUpdate)) ||
+      (hasApkUpdate && settingsForceUpdate) ||
+      (Boolean(settingsMinRequiredVersion) && isVersionNewer(settingsMinRequiredVersion, installedAppVersion)));
+
+  return {
+    maintenanceMode,
+    appName,
+    customLogoUrl,
+    currentApkVersion: cleanVersionDigits(installedAppVersion) || '2.6.0',
+    formattedCurrentVersion: formatVersionTag(installedAppVersion),
+    latestApkVersion,
+    formattedLatestVersion: latestApkVersion ? formatVersionTag(latestApkVersion) : formatVersionTag(installedAppVersion),
+    apkDownloadUrl,
+    shareDownloadUrl: shareDownloadUrlState || generalDownloadUrl || apkDownloadUrl || '',
+    officialWebsiteUrl: officialWebsiteUrlState || 'https://maxplay.app',
+    hasApkUpdate,
+    isRedBlinkActive,
+    redBlinkEnabled: settingsRedBlinkEnabled,
+    updateActive: settingsUpdateActive,
+    forceUpdate: isForceUpdateRequired,
+    updateTitle,
+    updateReleaseNotes,
+    updateBannerUrl,
+    adminUpdateMessage: matchedAdminUpdateMsg,
+    lastCheckedAt,
+    triggerManualUpdateCheck,
+  };
+}
